@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net10.0-windows10.0.19041</TargetFramework>
+		<Nullable>enable</Nullable>
+		<UseWindowsForms>true</UseWindowsForms>
+		<ImplicitUsings>enable</ImplicitUsings>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- LiveChartsCore 2.x 系の正しいパッケージ -->
+
+		<!-- ログ用（そのままでOK） -->
+		<PackageReference Include="LiveChartsCore" Version="2.0.4" />
+		<PackageReference Include="LiveChartsCore.SkiaSharpView" Version="2.0.4" />
+		<PackageReference Include="LiveChartsCore.SkiaSharpView.WinForms" Version="2.0.4" />
+		<PackageReference Include="NLog" Version="6.1.3" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\共通\共通.csproj" />
+		<ProjectReference Include="..\月別開催日程\レース情報取得.csproj" />
+	</ItemGroup>
+
+</Project>

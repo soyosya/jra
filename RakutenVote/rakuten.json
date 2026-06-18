@@ -1,0 +1,94 @@
+{
+  "RakutenVote": {
+    "_comment": "楽天競馬 投票Lite(bet_lite)による自動投票。認証情報は環境変数 RAKUTEN_USER / RAKUTEN_PASS。",
+
+    "Mode": "DryRun",
+    "_Mode_options": "DryRun=遷移と買い目をログのみ(無投票) / ConfirmStop=確認画面で停止し人が「投票する」を押す / Auto=投票確定まで自動(実課金)",
+
+    "BetType": "SanrentanMulti",
+    "PartnerCount": 4,
+    "StakePerPointYen": 100,
+    "_Stake_comment": "1点あたりの賭け金(円)。100円単位。3連単マルチ 軸1相手4=36点なら100円で3,600円。",
+
+    "DailyBudgetYen": 20000,
+    "MaxRaces": 0,
+    "Venues": [ ],
+
+    "Headless": false,
+    "ManualLoginAssistSeconds": 120,
+    "_ManualLogin_comment": "自動ログイン後にCAPTCHA/2段階認証が出た場合、人が操作する猶予秒数。",
+
+    "Urls": {
+      "BetLite": "https://bet.keiba.rakuten.co.jp/bet_lite"
+    },
+
+    "BetTypeValue": "9",
+    "_BetTypeValue_comment": "bet_lite の式別 select 値。三連単=9 / 三連複=8 / 馬単=6 / 馬複=5 / ワイド=7 / 単勝=1 / 複勝=2。",
+    "BetModeValue": "32",
+    "_BetModeValue_comment": "bet_lite の方式 select 値。流し=32。買い目選択画面の流し種別も 1着流し=32。",
+
+    "Selectors": {
+      "_comment": "投票Lite(bet_lite)の実DOM(プレーンHTMLフォーム)に基づく。",
+
+      "LoginUserInput": "#user_id",
+      "LoginUserNext": "#cta001",
+      "LoginPassInput": "#password_current",
+      "LoginPassNext": "#cta011",
+      "LoggedInMarker": "select[name='racecourseId']",
+
+      "SelRacecourse": "select[name='racecourseId']",
+      "SelRaceNumber": "select[name='raceNumber']",
+      "SelBetType": "select[name='betType']",
+      "SelBetMode": "select[name='betMode']",
+      "SubmitSelect": "input[name='select']",
+
+      "AxisRadioTemplate": "input[name='me1[]'][value='{UMA}']",
+      "PartnerCheckTemplate": "input[name='me2[]'][value='{UMA}']",
+      "MultiCheckbox": "input[name='isMulti']",
+      "AmountInput": "input[name='buyUnitCount']",
+      "SubmitConfirm": "input[name='confirm']",
+
+      "VerifyInput": "#cashConfirm",
+      "VoteSubmit": "input[name='inputBet']",
+      "BalanceText": ".information-balance, #balanceStatus li.balance .amount, li.balance .amount, li.balance .number"
+    },
+
+    "CompletedText": "受け付けました|投票完了|受付番号",
+    "_CompletedText_comment": "投票完了画面の判定に使う文言(| 区切りでいずれか一致=完了)。実機の完了画面=『…受け付けました』『投票Lite:投票完了』『受付番号』。",
+    "ClosedText": "発売を締め切",
+    "_ClosedText_comment": "レース選択画面の発売締切メッセージ(『そのレースは発売を締め切っています』)。検出時は投票中断・履歴に締切。",
+
+    "Deposit": {
+      "_comment": "楽天銀行からの入金。当日買い目の必要額(投票合計−残高)を自動計算。確認画面の「入金する」直前で停止(ConfirmStop)。Autoは作らない。",
+      "Url": "https://bet.keiba.rakuten.co.jp/bank/deposit",
+      "BufferYen": 0,
+      "_BufferYen_comment": "必要額に上乗せする余裕(円)。0で買い目ピッタリ。",
+      "MaxDepositYen": 50000,
+      "_MaxDepositYen_comment": "1回の入金上限ガード(誤計算時の安全弁)。これを超える計算額はその場で中止。",
+      "MethodValue": "rakutenBank",
+      "Selectors": {
+        "PopupCloseButton": ".pointUsagePopup__action button",
+        "PopupDontShowCheckbox": "#agreementCheckbox",
+        "MethodSelect": "select#select",
+        "AmountInput": "#transactionAmountInput",
+        "ConfirmButton": "form.transactionInput__main button[data-comp-id='actionButton_action']",
+        "ExecuteButton": "form.transactionConfirm button[data-comp-id='actionButton_action']",
+        "BalanceText": ".information-balance"
+      }
+    },
+
+    "Reference": {
+      "_comment": "照会(/reference)で暗証番号を入れ『残高照会』を実行し、投票資金の内訳を取得。暗証番号は環境変数 RAKUTEN_PIN か --pin。",
+      "Url": "https://bet.keiba.rakuten.co.jp/reference",
+      "Selectors": {
+        "PinInput": "#passcodeInput",
+        "BalanceSubmit": "#balanceInquiry",
+        "BalanceTab": ".k_toggleButton[tab='balance'] button, [tab='balance'] button",
+        "DetailList": ".balancePointInfo__list",
+        "ItemRow": ".balancePointInfo__list li.k_listItem",
+        "ItemLabel": ".k_listItemSubtitle",
+        "ItemValue": ".balancePointInfo__property"
+      }
+    }
+  }
+}

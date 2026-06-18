@@ -1,0 +1,71 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	
+		<PropertyGroup>
+			<OutputType>Exe</OutputType>
+			<TargetFramework>net10.0</TargetFramework>
+			<PublishSingleFile>true</PublishSingleFile>
+			<SelfContained>true</SelfContained>
+			<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+			<!-- or win-x86 -->
+			<EnableWindowsTargeting>true</EnableWindowsTargeting>
+			  <Nullable>enable</Nullable>
+
+		</PropertyGroup>
+
+	
+		<ItemGroup>
+		  <None Remove="nlog.config" />
+		</ItemGroup>
+	<ItemGroup>
+		<None Update="appsettings.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<Optimize>false</Optimize>
+	</PropertyGroup>
+	
+		<ItemGroup>
+		  <Content Include="..\共通\appsettings.json" Link="appsettings.json">
+		    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		  </Content>
+		  <Content Include="nlog.config">
+		    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		  </Content>
+		</ItemGroup>
+
+		<ItemGroup>
+			<None Include="..\Resources\AppIcon.ico" Pack="true" />
+		</ItemGroup>
+
+	
+	<ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.8" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.8" />
+    <PackageReference Include="Selenium.WebDriver" Version="4.44.0" />
+    <PackageReference Include="Selenium.WebDriver.ChromeDriver" Version="148.0.7778.17800" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\共通\共通.csproj" />
+    <ProjectReference Include="..\月別開催日程\レース情報取得.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Update="Properties\Resources.Designer.cs">
+      <DesignTime>True</DesignTime>
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Resources.resx</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Update="Properties\Resources.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+      <LastGenOutput>Resources.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

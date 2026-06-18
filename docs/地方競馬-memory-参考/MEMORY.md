@@ -1,0 +1,30 @@
+# Memory Index
+
+- [ContractStatusUpdate ビルド環境](contractstatusupdate-build.md) — MSBuild パス・MOTW解除・Selenium4.44改称の罠など、検証時の必須事項
+- [InvoiceUpload リファクタリング](invoiceupload-refactoring.md) — 作業フォルダ・___規約・XPath文字列の解析罠・ビルド手順
+- [UM790PRO の SoftEther/IKEEXT 競合](um790pro-softether-ikeext.md) — SoftEther VPN Server が UDP500/4500 占有 → Windows標準 L2TP VPN 不可
+- [地方競馬DB](chihou-keiba-db.md) — DB接続先・データの癖(着順列未使用/条件2書式)・fetch-rangeモード・HeadlessChrome UA 429対策
+- [高知 払戻ベース回収率](kochi-roi-payout.md) — 前残りバイアスは金額でも巨大(今走逃げ単勝205%)だが前走脚質では市場に織込済(74.7%≒控除率)
+- [高知 馬場差補正](kochi-track-variant.md) — 日次δ(レンジ7.78s)で補正、同セル勝ち時計SDが44%縮小。tools/kochi-track-variant.ps1
+- [高知 バックテスト](kochi-backtest.md) — 改良スコア(同型不在+補正後持時計)で本命単勝回収101.6%(閾値≥3で115%)。ただし95%CIは100%またぎ。tools/kochi-backtest.ps1
+- [高知 騎手×調教師・馬場](kochi-jockey-trainer-track.md) — 永森大×打越勇が本命級+EV、不良馬場で前残り極端化(逃げ勝率38%)、血統データは13%で使用不可
+- [高知 今走逃げの規定要因](kochi-lead-transition.md) — 前走脚質が最大予測子、乗替は前付け騎手への乗替時のみ逃げ率倍増、枠順は無関係。tools/kochi-lead-transition.ps1
+- [高知 逃げコネクション](kochi-lead-connections.md) — 調教師×馬主×騎手が逃げを強く規定。前傾厩舎(打越勇等)/前傾馬主(中村智幸等)、無名騎手×前傾連で穴の逃げ
+- [高知 馬軸勝率スコア](kochi-horse-score.md) — 前走/前々走ファクトで較正勝率%を算出。馬ファクトのみは73.6%(織込済)、展開統合で116.1%。tools/kochi-horse-score.ps1
+- [大井 回収率バックテスト](oi-roi-backtest.md) — プロファイルは勝率は当てる(score4勝率23%)が払戻は基準割れ。サブ条件の高回収は過学習。tools/oi-roi-backtest.ps1
+- [大井 脚質・コース](oi-kyaku-course.md) — 前残りコース(逃げIV1200=3.64)、勝敗は四角位置で決まる、まくりは1600m+で有効。脚質判定を四角ベース化(profile -LateCorner)。枠は脚質より遥かに小。tools/oi-kyaku-course.ps1
+- [大井ほか南関 騎手・調教師](oi-jockey-trainer.md) — 荒山勝は高勝率で安定だが深掘りすると単勝は織込済(軸向き)。南関4場とも頑健な過小評価厩舎なし=市場効率的。オッズ大井0件/血統14%。tools/oi-jockey-trainer.ps1
+- [園田 基礎分析](sonoda-basics.md) — 1400m主力、前残り(逃げIV2.94)・四角位置決定的・スプリント外枠有利・吉村智が支配的。年度ブレ大で複数年検証必須
+- [園田 軸検証・馬券・入替ルール](sonoda-axis-bet.md) — 軸勝率32%/複勝65%だが全券種100%割れ(複勝84%が最良)。軸入替ルールは複数年でノイズ=採用見送り。妙味は休養明け・吉村智。年ブレ巨大
+- [園田 追加調査](sonoda-extra.md) — 重馬場で前残り強化、永島太厩舎は軸補強(単勝は織込済)、減量騎手は妙味なし、距離短縮(特に降級)は複勝で堅い妙味・延長は軽視
+- [門別 分析キックオフ](monbetsu-kickoff.md) — 門別(N'門別')1000/1200m主体スプリント・季節開催。検証workflow/ツール/環境の罠/規律を集約した引き継ぎ。別セッション開始時にまず読む
+- [門別 基礎分析](monbetsu-basics.md) — 全ダ1000/1200m主体、前残り極端(逃げIV3.8で大井超)・四角決定的・外枠有利・落合玄太支配的。前走脚質が逃げ最大予測子・前傾厩(田中淳)/馬主(菅野守雄)・延長弱/長休明妙味
+- [門別 軸スコア・馬券](monbetsu-axis-bet.md) — 前残り軸スコアで本命勝率28%/複勝58%/単複回収83/82%、年別安定=過学習なし。tools/monbetsu-features/backtest/card/today。1600m+と新馬戦は低信頼
+- [川崎 分析キックオフ](kawasaki-kickoff.md) — 川崎(N'川崎')1400m主力・通年・南関(市場効率的)。馬体重-10kg妙味が有効。検証workflow/ツール/罠/規律を集約した引き継ぎ。別セッション開始時にまず読む
+- [川崎 基礎・軸検証](kawasaki-basics-axis.md) — 極端な前残り(逃げIV900m4.45/1400m2.96)・四角決定的・まくり1400m+有効・内枠微有利。軸有力度は標準重みで2年平均勝率25%/複勝54%/単回収72%=軸向き
+- [川崎 馬券BT・妙味](kawasaki-bet-value.md) — 3連複10点は回収約45%で割れ。馬体重-10kgは川崎では妙味なし(想定外・訂正)。堅さ=中5-13週&同距離、大幅短縮は軽視、重馬場で前残り強化
+- [川崎 騎手×厩舎・野畑](kawasaki-jockey-trainer.md) — 野畑は2026勝率22%へ急伸も単勝織込済=軸向き。堅コンビ=野畑×鈴木義/甲田悟・矢野貴×高月賢(複勝57%)、秋山直厩舎は回収3年>1.1。today-picksに川崎フラグ実装(堅同距/堅間隔/▽大短縮/△詰/堅コンビ/注厩)
+- [地方競馬 能力z汎用ツール](keiba-ability-toolkit.md) — -Venueで全場共通の軸スコア+能力z(レース内標準化)。tools/keiba-features/card/extract/score/backtest/nagashi。能力で全場勝率↑(門別28→34/高知34→38等)、既定重みWTime2.0/WUp31.0。複回収↑・単回収は場依存
+- [地方競馬 独自レーティング](keiba-rating-system.md) — イロは弱い、共通対戦相手h2h(着差連鎖)が強い軸予測、軸有力度=h2h+脚質+騎手+枠(0.5/0.2/0.2/0.1)で確度向上。危険ローテ減点も統合。tools/race-h2h・race-axis・*-backtest
+- [楽天競馬 自動投票](rakuten-vote.md) — RakutenVote(C#)。危険ローテ除外軸→3連単マルチ。DryRun/確認停止/全自動。bet_lite購入フォーム・入金・残高照会も実装
+- [コンピ指数取り込み](compi-index.md) — 日刊スポーツ極ウマのコンピ指数。DBテーブル/設定/相関分析ツール実装済、スクレイパは実HTML受領後
