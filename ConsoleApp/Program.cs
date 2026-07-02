@@ -53,6 +53,33 @@ namespace 中央競馬バッチ
                     case "nextraceinfo":
                         RunNextRaceInfo();
                         break;
+                    case "create-db":
+                        RunCreateDatabase();
+                        break;
+                    case "fetch-jra-range":
+                        RunFetchJraRange(args);
+                        break;
+                    case "fetch-jra-race":
+                        RunFetchJraRace(args);
+                        break;
+                    case "fetch-jra-official":
+                        RunFetchJraOfficial(args);
+                        break;
+                    case "fetch-danwa":
+                        競馬ブック取得.取得(args);
+                        break;
+                    case "fetch-cyokyo":
+                        競馬ブック取得.調教取得(args);
+                        break;
+                    case "fetch-uma":
+                        競馬ブック取得.完全データ取得(args);
+                        break;
+                    case "fetch-danwa-range":
+                        競馬ブック取得.取得範囲(args);
+                        break;
+                    case "fetch-cyokyo-range":
+                        競馬ブック取得.調教取得範囲(args);
+                        break;
                     case "fetch-schedule":
                         開催日程.取得(args);
                         break;
@@ -92,6 +119,88 @@ namespace 中央競馬バッチ
                 CommonLogger.Log("バッチ処理を終了しました。", 1);
                 Debug.WriteLine("バッチ処理を終了しました。");
             }
+        }
+
+        /// <summary>
+        /// fetch-jra-range処理。netkeibaから指定日付範囲のJRA全レース(結果・レース情報・払戻・確定オッズ)を
+        /// 未取得分だけ取得して保存します。スモークテストは開始日=終了日(1日)で実行します。
+        /// </summary>
+        /// <param name="args">第2引数に開始日、第3引数に終了日(yyyy-MM-dd)、第4引数に任意の待機ミリ秒を指定します。</param>
+        private static void RunFetchJraRange(string[] args)
+        {
+            if (!DateOnly.TryParse(args.ElementAtOrDefault(1), out var from) ||
+                !DateOnly.TryParse(args.ElementAtOrDefault(2), out var to))
+            {
+                CommonLogger.Log("引数が不正です。fetch-jra-range <開始日> <終了日> [待機ミリ秒] (yyyy-MM-dd) の形式で指定してください。");
+                return;
+            }
+
+            // force: 既取得レースも再取得し、レース情報(枠番/性別/馬齢/調教師/馬主)を最新netkeibaで上書き(欠落補完用)。
+            bool force = args.Any(a => string.Equals(a, "force", StringComparison.OrdinalIgnoreCase));
+            if (int.TryParse(args.ElementAtOrDefault(3), out var delayMs) && delayMs >= 0)
+            {
+                JRA取込.FetchRange(from, to, delayMs, force);
+            }
+            else
+            {
+                JRA取込.FetchRange(from, to, force: force);
+            }
+        }
+
+        /// <summary>
+        /// fetch-jra-official処理。JRA公式サイト(www.jra.go.jp)から指定日付範囲の競走結果・払戻金を取得して保存します。
+        /// netkeiba(db.netkeiba)が当日結果を翌日まで反映しないラグを解消するため、当日/直近の即時取得に使います。
+        /// 公式は約2ヶ月のみ保持のため、過去数年の一括backfillは fetch-jra-range(netkeiba)を使用してください。
+        /// </summary>
+        /// <param name="args">第2引数に開始日、第3引数に終了日(yyyy-MM-dd)、第4引数に任意の待機ミリ秒を指定します。</param>
+        private static void RunFetchJraOfficial(string[] args)
+        {
+            if (!DateOnly.TryParse(args.ElementAtOrDefault(1), out var from) ||
+                !DateOnly.TryParse(args.ElementAtOrDefault(2), out var to))
+            {
+                CommonLogger.Log("引数が不正です。fetch-jra-official <開始日> <終了日> [待機ミリ秒] (yyyy-MM-dd) の形式で指定してください。");
+                return;
+            }
+
+            if (int.TryParse(args.ElementAtOrDefault(3), out var delayMs) && delayMs >= 0)
+            {
+                JRA取込.FetchOfficialRange(from, to, delayMs);
+            }
+            else
+            {
+                JRA取込.FetchOfficialRange(from, to);
+            }
+        }
+
+        /// <summary>
+        /// fetch-jra-race処理。単一のnetkeiba race_idを取得・保存します(解析確認・デバッグ用)。
+        /// </summary>
+        /// <param name="args">第2引数にrace_id(12桁)、第3引数に開催日(yyyy-MM-dd)を指定します。</param>
+        private static void RunFetchJraRace(string[] args)
+        {
+            var raceId = args.ElementAtOrDefault(1) ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(raceId) || !DateOnly.TryParse(args.ElementAtOrDefault(2), out var raceDate))
+            {
+                CommonLogger.Log("引数が不正です。fetch-jra-race <race_id> <開催日(yyyy-MM-dd)> の形式で指定してください。");
+                return;
+            }
+
+            JRA取込.FetchAndStoreRace(raceId, raceDate);
+        }
+
+        /// <summary>
+        /// 中央競馬DBが未作成の場合に、現在のEFモデルから全テーブルを生成します。
+        /// このプロジェクトはEFマイグレーションを運用しておらず(地方競馬DBも__EFMigrationsHistory無し=EnsureCreatedで生成)、
+        /// スキーマはモデル定義を正とするため、新規DBはEnsureCreatedで作成します。
+        /// 既にDBが存在する場合は何もしません(既存テーブルの差分追加は行いません)。
+        /// </summary>
+        private static void RunCreateDatabase()
+        {
+            using var context = new DBContext();
+            var created = context.Database.EnsureCreated();
+            CommonLogger.Log(created
+                ? "中央競馬DBを新規作成し、全テーブルを生成しました。"
+                : "中央競馬DBは既に存在するため、EnsureCreatedは何も行いませんでした。");
         }
 
         /// <summary>

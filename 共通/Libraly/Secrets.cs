@@ -60,5 +60,7 @@ namespace 中央競馬.共通.Libraly
         public static string? RakutenPin => Get("RakutenPin", "RAKUTEN_PIN");
         public static string? GokuUmaUser => Get("GokuUmaUser", "GOKUUMA_USER");
         public static string? GokuUmaPass => Get("GokuUmaPass", "GOKUUMA_PASS");
+        public static string? KeibabookUser => Get("KeibabookUser", "KEIBABOOK_USER");
+        public static string? KeibabookPass => Get("KeibabookPass", "KEIBABOOK_PASS");
     }
 }

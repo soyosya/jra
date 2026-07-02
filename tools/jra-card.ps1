@@ -1,0 +1,819 @@
+<#
+.SYNOPSIS
+  JRA当日カード: h2h(地力) + danwa+調教スコアV3 + コンピ指数 をレース内Z合成して軸/相手/消しを出力。
+.DESCRIPTION
+  3因子をレース内で標準化し加重合成(既定 h2h0.4 / V3 0.35 / コンピ0.25)。danwa消しフラグは最終で消しに落とす。
+  事前に対象日の fetch-jra-range(結果/出馬表) + fetch-danwa + fetch-cyokyo + fetch-compi が必要。
+.EXAMPLE
+  .\jra-card.ps1 -Date 2023-11-26 -Venue 東京
+#>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory)][string]$Date,
+  [Parameter(Mandatory)][string]$Venue,
+  [double]$W_h2h=0.4, [double]$W_v3=0.35, [double]$W_compi=0.25,
+  [switch]$NoCondH2h,    # h2hの同条件限定連鎖を無効化(既定=有効)。既定は今走と同種別×距離±200mの過去走のみで連鎖(検証で軸複勝率+2〜4pt全期間[[keiba-rating-system]])
+  [double]$W_front=-1,   # 先行力(前残り)因子の重み。-1=自動(前残り場のみ既定値、それ以外0)。検証=函館で軸確度に上乗せ価値([[hakodate-basics]])
+  [double]$W_rota=0.15,  # 昨年同開催の好走馬プロファイル合致度の軸ブースト重み([[jra-meeting-rotation]])。0で無効。前走ローテ×同場の昨年同条件複勝率を軸スコアに加点
+  [int]$RecentN=5, [int]$RecentDays=183,
+  [int]$WeightGainThresh=8, # 馬体重大幅増の軸割引閾値(+kg)。+このkg以上増で◎軸に▽増(過剰人気)。当日体重発表後のみ([[jra-meeting-rotation]])
+  [switch]$NoAxisCap, # 軸足切り(コンピ上位3)を無効化。既定=有効: 総合1位のコンピ順位が4位以下ならコンピ上位3内の総合最上位を軸に差替([[keiba-axis-method-comparison]] 2026-06-27検証=中位軸は複勝激減)
+  [int]$AxisCapRank=3, # 軸足切りのコンピ順位閾値(既定3=上位3)。総合1位のコンピ順位>この値なら上位N内の総合最上位へ差替
+  [switch]$NoBayes, # ベイズ較正複勝確率(モデルA:順位band+指数Z+h2h)の軸付与を無効化。既定=有効: 軸の複勝確率%+確度(鉄板/標準/警戒)を確度ラダーに併記([[jra-bayes-fukusho-calibration]] OOS較正ECE0.46%)
+  [switch]$Notify,  # 通知用: 各レースの軸/相手を1行テキストで Write-Output(メール本文用)。表は出さない。
+  [switch]$NotifyFull, # 地方競馬同形式の全頭カード行を出力(発走時刻つき・印◎○△+調教矢印+コンピ順位(指数)+人気+JRAフラグ)。jra-card-full.ps1が全場を時刻順に束ねる用。
+  [switch]$WithResult, # -NotifyFull時、各頭の先頭に確定着順を付加(振り返り用)。競走結果(着順)が必要。
+  [switch]$ExportBets, # 買目出力用: 各レースの 軸 + 総合上位N頭(相手) を機械可読行で出力(三連複等を厚く)。表/Notifyより優先。
+  [int]$ExportN=5,  # ExportBetsの相手頭数(総合上位N、消除く)。
+  [switch]$NegSelect, # 選び方=ネガティブ要素数で消しウマ除外→残り総合上位5頭→軸(総合1位)+相手4で流す。表示。-ExportBets併用でEXPORT行も出力
+  [int]$NegThreshold=2, # 消し閾値: ネガティブ要素がこの数以上の馬を消す(既定2)
+  [switch]$FunnelSelect, # ファネル選択=①ネガ除外→②総合上位5に絞る→③ポジティブ要素ありに絞る→最終プールから軸をコンピ順位で3通り(上位/下位/中位)。FUNNEL行出力
+  [switch]$FunnelDump # 全頭ダンプ: 各馬の 馬番/コンピ/総合/プール内/V3軸/ネガ内訳/ポジ数 をDUMP行出力(相手ルールのオフライン検証用)
+)
+$ErrorActionPreference='Stop'
+$appsettings = Join-Path $PSScriptRoot '..\共通\appsettings.json'
+$connStr = (Get-Content $appsettings -Raw -Encoding UTF8 | ConvertFrom-Json).ConnectionStrings.DefaultConnection
+$conn = New-Object System.Data.SqlClient.SqlConnection($connStr); $conn.Open()
+# ベイズ較正モデルA(順位band+指数Z+h2h→較正済み複勝確率)。C:\jra\fukushima-analysis\jra-bayes-finalize.ps1が全データ学習で出力。欠落時はnull=無効。[[jra-bayes-fukusho-calibration]]
+$script:BayesA=$null
+if(-not $NoBayes){ try{ $bjson=Join-Path $PSScriptRoot 'jra-bayes-model-A.json'; if(Test-Path $bjson){ $script:BayesA=(Get-Content $bjson -Raw -Encoding UTF8 | ConvertFrom-Json) } }catch{ $script:BayesA=$null } }
+function Invoke-Rows([string]$sql,[hashtable]$p){
+  # 一過性SQLエラー(取込backfillとの競合等)に1回リトライ。接続が生きていれば同一接続で再試行(#fld一時表を温存)、切れていた場合のみ再接続。
+  for($attempt=1; $attempt -le 2; $attempt++){
+    try {
+      if($conn.State -ne [System.Data.ConnectionState]::Open){ $conn.Open() }
+      $cmd=$conn.CreateCommand(); $cmd.CommandTimeout=180; $cmd.CommandText=$sql
+      foreach($k in $p.Keys){ [void]$cmd.Parameters.AddWithValue($k,$p[$k]) }
+      $r=$cmd.ExecuteReader(); $rows=@(); while($r.Read()){ $o=@{}; for($i=0;$i -lt $r.FieldCount;$i++){ $o[$r.GetName($i)]=$r.GetValue($i) }; $rows+=[PSCustomObject]$o }; $r.Close(); return ,$rows
+    } catch { if($attempt -ge 2){ throw }; Start-Sleep -Milliseconds 400 }
+  }
+}
+function Median($a){ $s=@($a|Sort-Object); $n=$s.Count; if($n -eq 0){return $null}; if($n%2 -eq 1){return [double]$s[[int](($n-1)/2)]}; return ([double]$s[$n/2-1]+[double]$s[$n/2])/2.0 }
+function ZMap($map){ $v=@($map.Values); $z=@{}; if($v.Count -eq 0){return $z}; $m=($v|Measure-Object -Average).Average
+  $sd= if($v.Count -gt 1){ [Math]::Sqrt((($v|ForEach-Object{($_-$m)*($_-$m)})|Measure-Object -Sum).Sum/($v.Count-1)) } else {0}
+  foreach($k in $map.Keys){ $z[$k]= if($sd -gt 0){($map[$k]-$m)/$sd}else{0.0} }; return $z }
+
+# 1レースのh2h地力(走破時計の共通相手着差・勝ち時計比%)。馬名->score
+function Compute-H2h([string]$v,[string]$d,[int]$rno){
+  $dmin=([datetime]$d).AddDays(-$RecentDays).ToString('yyyy-MM-dd')
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  $field=@($ent|ForEach-Object{[string]$_.馬名}); $fset=@{}; $field|ForEach-Object{$fset[$_]=$true}
+  # 同条件限定連鎖([[keiba-rating-system]]・全期間で軸複勝率+2〜4pt): 今走と同種別×距離±200mの過去走のみで連鎖。N=6/365日窓。
+  $tc=Invoke-Rows "SELECT TOP 1 コース種別 surf,TRY_CAST(距離 AS int) dist FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  $tsurf= if(@($tc).Count -gt 0){[string]@($tc)[0].surf}else{''}
+  $tdist= if(@($tc).Count -gt 0 -and @($tc)[0].dist -isnot [DBNull]){[int]@($tc)[0].dist}else{0}
+  $useCond = (-not $NoCondH2h) -and $tsurf -ne '' -and $tdist -gt 0
+  $dminC=([datetime]$d).AddDays(-365).ToString('yyyy-MM-dd')
+  $recent=@{}; $allK=@{}
+  foreach($h in $field){ $rk= if($useCond){
+      Invoke-Rows "SELECT TOP 6 k.開催場所,k.開催日,k.レース番号 FROM 競走結果 k JOIN レース情報 ri ON ri.開催場所=k.開催場所 AND ri.開催日=k.開催日 AND ri.レース番号=k.レース番号 AND ri.馬名=k.馬名 WHERE k.馬名=@h AND k.開催日<@d AND k.開催日>=@m AND k.走破時計>0 AND ri.コース種別=@surf AND ABS(TRY_CAST(ri.距離 AS int)-@dist)<=200 ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d;'@m'=$dminC;'@surf'=$tsurf;'@dist'=$tdist}
+    }else{
+      Invoke-Rows "SELECT TOP ($RecentN) 開催場所,開催日,レース番号 FROM 競走結果 WHERE 馬名=@h AND 開催日<@d AND 開催日>=@m AND 走破時計>0 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d;'@m'=$dmin} }
+    $ks=@(); foreach($x in $rk){ $k='{0}|{1:yyyy-MM-dd}|{2}' -f $x.開催場所,$x.開催日,$x.レース番号; $ks+=$k; if(-not $allK.ContainsKey($k)){$allK[$k]=@{v=[string]$x.開催場所;d=([datetime]$x.開催日).ToString('yyyy-MM-dd');r=[int]$x.レース番号}} }; $recent[$h]=$ks }
+  $rr=@{}; foreach($k in $allK.Keys){ $i=$allK[$k]; $rows=Invoke-Rows "SELECT 馬名,走破時計 FROM 競走結果 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r AND 走破時計>0 AND 着順>0" @{'@v'=$i.v;'@d'=$i.d;'@r'=$i.r}
+    $m=@{}; foreach($row in $rows){ $m[[string]$row.馬名]=[double]$row.走破時計 }; $rr[$k]=$m }
+  $mavg=@{}; foreach($a in $field){ $mavg[$a]=@{}; $tmp=@{}
+    foreach($k in $recent[$a]){ $m=$rr[$k]; if(-not $m.ContainsKey($a)){continue}; $ta=$m[$a]; $wt=($m.Values|Measure-Object -Minimum).Minimum; if($wt -le 0){continue}
+      foreach($x in $m.Keys){ if($x -eq $a){continue}; $rel=($m[$x]-$ta)/$wt*100.0; if($rel -gt 8){$rel=8}elseif($rel -lt -8){$rel=-8}; if(-not $tmp.ContainsKey($x)){$tmp[$x]=New-Object System.Collections.Generic.List[double]}; $tmp[$x].Add($rel) } }
+    foreach($x in $tmp.Keys){ $mavg[$a][$x]=Median $tmp[$x] } }
+  function PairM($a,$b){ $vv=@(); if($mavg[$a].ContainsKey($b)){$vv+=$mavg[$a][$b]}; if($mavg[$b].ContainsKey($a)){$vv+=(-1.0*$mavg[$b][$a])}; if($vv.Count -gt 0){return (($vv|Measure-Object -Average).Average)}
+    $common=@($mavg[$a].Keys|Where-Object{$mavg[$b].ContainsKey($_) -and $_ -ne $a -and $_ -ne $b}); if($common.Count -eq 0){return $null}
+    $fc=@($common|Where-Object{$fset.ContainsKey($_)}); $use= if($fc.Count -gt 0){$fc}else{$common}; $est=foreach($c in $use){ $mavg[$a][$c]-$mavg[$b][$c] }; return (Median $est) }
+  $h2h=@{}; foreach($a in $field){ $ms=@(); foreach($b in $field){ if($a -ne $b){ $m=PairM $a $b; if($null -ne $m){$ms+=$m} } }; if($ms.Count -ge 1){ $h2h[$a]=($ms|Measure-Object -Average).Average } }
+  return $h2h
+}
+
+# ★末脚signal: 前走・前々走とも 上り3Fレース内ベスト3 かつ 1着との着差≤1.2秒(前2走365日内)。馬名->status
+#   status: '★'=成立かつ前走と今走が同コース / '★替'=成立だがコース替わり(=末脚好調が引き継がない=軸格上げしない) / ''
+function Compute-AgariFlag([string]$v,[string]$d,[int]$rno,[string]$todaySurf){
+  $m=([datetime]$d).AddDays(-365).ToString('yyyy-MM-dd')
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $pr=Invoke-Rows "SELECT TOP 2 k.一着馬着差タイム mgn, ri2.コース種別 csurf,
+        (SELECT COUNT(*)+1 FROM 競走結果 k2 WHERE k2.開催場所=k.開催場所 AND k2.開催日=k.開催日 AND k2.レース番号=k.レース番号 AND k2.上り3F>0 AND k2.上り3F<k.上り3F) agrank
+      FROM 競走結果 k JOIN レース情報 ri2 ON ri2.開催場所=k.開催場所 AND ri2.開催日=k.開催日 AND ri2.レース番号=k.レース番号 AND ri2.馬番=k.馬番
+      WHERE k.馬名=@h AND k.開催日<@d AND k.開催日>=@m AND k.上り3F>0 AND k.着順>0
+      ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d;'@m'=$m}
+    $st=''
+    if($pr.Count -ge 2){
+      $g1=[int]$pr[0].agrank; $g2=[int]$pr[1].agrank
+      $m1= if($pr[0].mgn -is [DBNull]){99.0}else{[double]$pr[0].mgn}
+      $m2= if($pr[1].mgn -is [DBNull]){99.0}else{[double]$pr[1].mgn}
+      if($g1 -le 3 -and $g2 -le 3 -and $m1 -le 1.2 -and $m2 -le 1.2){
+        $psurf=[string]$pr[0].csurf
+        $st= if($todaySurf -and $psurf -eq $todaySurf){'★'}else{'★替'}   # コース替わりは末脚好調が引き継がない
+      }
+    }
+    $flag[$h]=$st }
+  return $flag
+}
+
+# 危険軸フィルタ: 前走で1着と2秒以上の着差で負け かつ その前走が格上挑戦でない(前走クラス≤今走クラス)。馬名->bool
+#   クラスは レース情報.条件 から序列化(未勝利/新馬0<1勝1<2勝2<3勝3<オープン4)。今走クラス不明(-1)時は判定しない。
+function Compute-DangerFlag([string]$v,[string]$d,[int]$rno,[int]$todayCls){
+  $flag=@{}; if($todayCls -lt 0){ return $flag }
+  $m=([datetime]$d).AddDays(-365).ToString('yyyy-MM-dd')
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $pr=Invoke-Rows "SELECT TOP 1 k.一着馬着差タイム mgn,
+        CASE WHEN ri2.条件 LIKE N'%3勝クラス%' THEN 3 WHEN ri2.条件 LIKE N'%2勝クラス%' THEN 2
+             WHEN ri2.条件 LIKE N'%1勝クラス%' THEN 1 WHEN ri2.条件 LIKE N'%オープン%' THEN 4
+             WHEN ri2.条件 LIKE N'%未勝利%' OR ri2.条件 LIKE N'%新馬%' THEN 0 ELSE -1 END pcls
+      FROM 競走結果 k JOIN レース情報 ri2 ON ri2.開催場所=k.開催場所 AND ri2.開催日=k.開催日 AND ri2.レース番号=k.レース番号 AND ri2.馬番=k.馬番
+      WHERE k.馬名=@h AND k.開催日<@d AND k.開催日>=@m AND k.着順>0
+      ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d;'@m'=$m}
+    $dg=$false
+    if($pr.Count -ge 1){
+      $pm= if($pr[0].mgn -is [DBNull]){$null}else{[double]$pr[0].mgn}
+      $pc=[int]$pr[0].pcls
+      if($null -ne $pm -and $pm -ge 2.0 -and $pc -ge 0 -and $pc -le $todayCls){ $dg=$true }
+    }
+    $flag[$h]=$dg }
+  return $flag
+}
+
+# コンピ指数が前走から大幅下降(今走指数−前走指数≤-10)=格上挑戦の目安。コンピ1位軸の割引に使う。馬名->bool
+#   検証: コンピ1位でも大幅下降だと複勝54.8%(他の1位は約63%)。順位で割ると変化は概ね無効=これは1位の格上挑戦警告用。
+function Compute-CompiDrop([string]$v,[string]$d,[int]$rno){
+  $m=([datetime]$d).AddDays(-120).ToString('yyyy-MM-dd')
+  $cur=Invoke-Rows "SELECT 馬名,CAST(指数 AS int) idx FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 取得日時 DESC) rn FROM コンピ指数 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r) t WHERE rn=1" @{'@d'=$d;'@v'=$v;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $cur){ $h=[string]$e.馬名; if($e.idx -is [DBNull]){ continue }; $ci=[int]$e.idx
+    $pr=Invoke-Rows "SELECT TOP 1 CAST(指数 AS int) idx FROM コンピ指数 WHERE 馬名=@h AND 開催日<@d AND 開催日>=@m AND 指数 IS NOT NULL ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d;'@m'=$m}
+    $dg=$false
+    if($pr.Count -ge 1 -and $pr[0].idx -isnot [DBNull]){ if(($ci-[int]$pr[0].idx) -le -10){ $dg=$true } }
+    $flag[$h]=$dg }
+  return $flag
+}
+
+# 2走累積のコンピ指数下降: 前々走指数 − 今走指数 ≥ 8(=前々走→今走で8以上下げた)。軸候補(コンピ1位)の評価ダウンに使う。馬名->bool
+#   検証: コンピ1位でも2走累積下降≥8だと複勝率約48%(基準63%)・全5年で-10〜-19pt一貫=頑健な危険信号([[jra-compi-trajectory]])。前走1段の格より捕捉広く頑健
+function Compute-CompiDecline2([string]$v,[string]$d,[int]$rno){
+  $cur=Invoke-Rows "SELECT 馬名,CAST(指数 AS int) idx FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 取得日時 DESC) rn FROM コンピ指数 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r) t WHERE rn=1" @{'@d'=$d;'@v'=$v;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $cur){ $h=[string]$e.馬名; if($e.idx -is [DBNull]){ continue }; $ci=[int]$e.idx
+    # 前々走(2番目に新しい過去コンピ・レース単位最新スナップ)の指数
+    $pr=Invoke-Rows "SELECT TOP 2 CAST(指数 AS int) idx FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 開催日,開催場所,レース番号 ORDER BY 取得日時 DESC) rr FROM コンピ指数 WHERE 馬名=@h AND 開催日<@d AND 指数 IS NOT NULL) z WHERE z.rr=1 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    $dg=$false
+    if($pr.Count -ge 2 -and $pr[1].idx -isnot [DBNull]){ if(([int]$pr[1].idx - $ci) -ge 8){ $dg=$true } }
+    $flag[$h]=$dg }
+  return $flag
+}
+
+# コンピ指数2段連続上昇(信頼): 今走-前走≥Δ かつ 前走-前々走≥Δ(指数が2走連続でΔ以上上昇)。馬名->bool
+#   検証(2026-06-20地方反映): 今走1-3位band内で連続上昇は複勝率+5〜7pt・全5年頑健(基準~51%→55〜59%, [[keiba-universal-signals]])。連続下降は既存▼降(前々走-今走≥8)に内包のため信頼側のみ採用。コンピ指数のみ=前日カードで算出可。
+function Compute-CompiRise([string]$v,[string]$d,[int]$rno,[int]$Delta=4){
+  $cur=Invoke-Rows "SELECT 馬名,CAST(指数 AS int) idx FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 取得日時 DESC) rn FROM コンピ指数 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r) t WHERE rn=1" @{'@d'=$d;'@v'=$v;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $cur){ $h=[string]$e.馬名; if($e.idx -is [DBNull]){ continue }; $ci=[int]$e.idx
+    $pr=Invoke-Rows "SELECT TOP 2 CAST(指数 AS int) idx FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 開催日,開催場所,レース番号 ORDER BY 取得日時 DESC) rr FROM コンピ指数 WHERE 馬名=@h AND 開催日<@d AND 指数 IS NOT NULL) z WHERE z.rr=1 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    $rise=$false
+    if($pr.Count -ge 2 -and $pr[0].idx -isnot [DBNull] -and $pr[1].idx -isnot [DBNull]){
+      $i1=[int]$pr[0].idx; $i2=[int]$pr[1].idx
+      if(($ci-$i1) -ge $Delta -and ($i1-$i2) -ge $Delta){ $rise=$true }
+    }
+    $flag[$h]=$rise }
+  return $flag
+}
+
+# コンピ「安定上位」(段階化): 今走順位≤T 前提で 馬名->'安'/'安★'/''。前走なしは対象外(割引しない)。
+#   安  = 前走順位≤T(2走順位)。検証: 今走band固定で前走上位は複勝+3〜7pt・全5年([[jra-compi-trajectory]])。
+#   安★ = 安 かつ 過去3走平均指数値≥Hi(3走そろい)。検証: 今走1位で過去3走平均80+複69.7%/73-79=66.9%(基準63%)・全5年頑健(値版は順位版より強い)。回収は別軸。
+function Compute-CompiStable([string]$v,[string]$d,[int]$rno,[int]$T=3,[int]$Hi=73){
+  $cur=Invoke-Rows "SELECT 馬名,指数順位 FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 取得日時 DESC) rn FROM コンピ指数 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r AND 指数順位 IS NOT NULL) t WHERE rn=1" @{'@d'=$d;'@v'=$v;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $cur){ $h=[string]$e.馬名; if($e.指数順位 -is [DBNull]){ continue }; $ci=[int]$e.指数順位; if($ci -gt $T){ $flag[$h]=''; continue }
+    $pr=Invoke-Rows "SELECT TOP 3 指数順位 r,CAST(指数 AS int) val FROM (SELECT 指数順位,指数,開催日,レース番号,ROW_NUMBER() OVER(PARTITION BY 開催日,開催場所,レース番号 ORDER BY 取得日時 DESC) rr FROM コンピ指数 WHERE 馬名=@h AND 開催日<@d AND 指数順位 IS NOT NULL) z WHERE z.rr=1 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    $st=''
+    if($pr.Count -ge 1 -and $pr[0].r -isnot [DBNull] -and [int]$pr[0].r -le $T){
+      $st='安'
+      if($pr.Count -ge 3){
+        $vals=@($pr | ForEach-Object { if($_.val -isnot [DBNull]){ [int]$_.val } })
+        if($vals.Count -ge 3 -and (($vals|Measure-Object -Average).Average) -ge $Hi){ $st='安★' }
+      }
+    }
+    $flag[$h]=$st }
+  return $flag
+}
+
+# 調教3走パターン: 馬名->@{up3=直近3走(今走含む)↗回数; sneg=今走短評ネガ; up0=今走↗}。完全な2022-2024で検証([[jra-comment-axis]])。
+#   買い: 過去3走の↗回数が多いほど複勝率単調上昇(今走1位 0回61.6%→3回69.0%・全band単調)=単発↗より持続↗が強い。
+#   消し: 今走1位×調教短評ネガ(一杯/促/平凡/物足/案外/余裕等)は複勝-3〜5pt・全3年頑健。短評ポジ語は中立と同じ(買い上乗せ無)=効くのはネガ方向のみ。
+function Compute-CyokyoMom([string]$v,[string]$d,[int]$rno){
+  $cur=Invoke-Rows "SELECT 馬名 FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 取得日時 DESC) rn FROM 調教 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r) t WHERE rn=1" @{'@d'=$d;'@v'=$v;'@r'=$rno}
+  $neg='一杯|促|追われ|案外|平凡|物足|鈍|重め|見劣|余裕|息持'
+  $flag=@{}
+  foreach($e in $cur){ $h=[string]$e.馬名
+    $rows=Invoke-Rows "SELECT TOP 3 矢印,追い切り短評,開催日 FROM (SELECT 矢印,追い切り短評,開催日,レース番号,開催場所,ROW_NUMBER() OVER(PARTITION BY 開催日,開催場所,レース番号 ORDER BY 取得日時 DESC) rr FROM 調教 WHERE 馬名=@h AND 開催日<=@d) z WHERE z.rr=1 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    $up3=0; $sneg=$false; $up0=$false
+    foreach($row in $rows){ if(([string]$row.矢印) -match '↗|↑'){ $up3++ } }
+    if($rows.Count -ge 1 -and $rows[0].開催日 -isnot [DBNull] -and ([datetime]$rows[0].開催日).ToString('yyyy-MM-dd') -eq $d){
+      if(([string]$rows[0].矢印) -match '↗|↑'){ $up0=$true }
+      $s0=[string]$rows[0].追い切り短評; if($s0 -and $s0 -match $neg){ $sneg=$true } }
+    $flag[$h]=@{up3=$up3;sneg=$sneg;up0=$up0} }
+  return $flag
+}
+
+# 厩舎の話コメントの悪化(前走=強気 → 今走=弱気)。馬名->bool。◎/○の軽い割引に使う。印は不使用=本文センチメント(句レベル+否定考慮の辞書)で判定。
+#   検証(2026-06-20): 厩舎/馬主でコメント↔成績の相関に異質性は実在(OOSでも相関厩舎の強気-弱気+8.2pt>プラセボ)が、今走コンピband固定では軸band(1-3位)でレベルも変化も基準を上回らない=コンピ織込([[jra-comment-axis]])。唯一「強→弱(悪化)」だけ全band-2〜4pt一貫=弱い危険。賭け妙味でなく表示確度。
+$DanwaPos=@('上々','絶好','勝ち負け','勝機','勝てる','勝負強','通用','堅実','完成度','申し分','順調','攻め駆け','気配は良','気配いい','動きがい','動き抜群','絞れ','仕上がり良','力は上位','能力は高','地力上位','自信','上昇度','上向','良化','良くなっ','見せ場','楽しみ','態勢は整','態勢が整','態勢は万全','一変')
+$DanwaNeg=@('鍵を握','鍵に','課題','厳しい','難しい','半信半疑','物足り','詰めが甘','ひと息','もう一息','叩き台','叩き2','叩き二','試走','度外視','様子を','微妙','不安','平凡','良くない','上がってこ','上がらな','ノド鳴','善戦','展開次第','流れ次第','できれば','ならば面白','甘い面','甘く')
+function Score-Danwa([string]$txt){ if([string]::IsNullOrEmpty($txt)){ return 'M' }; $p=0;$n=0; foreach($w in $script:DanwaPos){ if($txt -like "*$w*"){ $p++ } }; foreach($w in $script:DanwaNeg){ if($txt -like "*$w*"){ $n++ } }; if($p -ge 1 -and $n -eq 0){'P'}elseif($n -ge 1 -and $p -eq 0){'N'}else{'M'} }
+function Compute-DanwaTrend([string]$v,[string]$d,[int]$rno){
+  $cur=Invoke-Rows "SELECT 馬名,コメント FROM (SELECT 馬名,コメント,ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 取得日時 DESC) rn FROM 厩舎の話 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r AND コメント IS NOT NULL) t WHERE rn=1" @{'@d'=$d;'@v'=$v;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $cur){ $h=[string]$e.馬名; $cs=Score-Danwa ([string]$e.コメント)
+    $pr=Invoke-Rows "SELECT TOP 1 コメント FROM (SELECT コメント,開催日,レース番号,ROW_NUMBER() OVER(PARTITION BY 開催日,開催場所,レース番号 ORDER BY 取得日時 DESC) rr FROM 厩舎の話 WHERE 馬名=@h AND 開催日<@d AND コメント IS NOT NULL) z WHERE z.rr=1 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    $ps= if($pr.Count -ge 1){ Score-Danwa ([string]$pr[0].コメント) }else{ 'M' }
+    $flag[$h]= ($ps -eq 'P' -and $cs -eq 'N') }   # 前走強気→今走弱気=悪化
+  return $flag
+}
+
+# 先行力(前残り)signal: 直近最大5走(任意場/400日内)の 四コーナー位置率<=0.33 or 逃げ の割合=lead_rate(0..1)。
+#   前残り場(函館等)では先行力が高い馬ほど軸確度が上がる(コンピ順位制御後も複勝+8pt・全年で符号一貫=[[hakodate-basics]])。馬名->@{lead;np}
+function Compute-FrontStyle([string]$v,[string]$d,[int]$rno){
+  $m=([datetime]$d).AddDays(-400).ToString('yyyy-MM-dd')
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $r=Invoke-Rows "SELECT AVG(CASE WHEN k.四コーナー=1 OR CAST(k.四コーナー AS float)/f.fld<=0.33 THEN 1.0 ELSE 0 END) lead,
+        AVG(CAST(k.四コーナー AS float)/f.fld) posr, COUNT(*) np
+      FROM (SELECT TOP ($RecentN) 開催場所 v,開催日 dd,レース番号 rr,四コーナー FROM 競走結果
+            WHERE 馬名=@h AND 開催日<@d AND 開催日>=@m AND 四コーナー>0 AND 着順>0
+            ORDER BY 開催日 DESC,レース番号 DESC) k
+      JOIN #fld f ON f.v=k.v AND f.dd=k.dd AND f.rr=k.rr" @{'@h'=$h;'@d'=$d;'@m'=$m}
+    $lead= if($r.Count -gt 0 -and $r[0].lead -isnot [DBNull]){[double]$r[0].lead}else{$null}
+    $np= if($r.Count -gt 0 -and $r[0].np -isnot [DBNull]){[int]$r[0].np}else{0}
+    $flag[$h]=@{lead=$lead; np=$np} }
+  return $flag
+}
+
+# 前走脚質(四コーナー相対位置で1逃/2先/3差/4追): 直近1走(400日内)。差し有利場(東京)の本命割引に使う。馬名->1..4 or null
+#   検証: 東京はコンピ1位の軸でもダ×前走逃だと複勝率58.5%(ダ他脚質65%)・全年一貫=前残りペナルティの裏返し([[tokyo-basics]])。
+function Compute-PrevStyle([string]$v,[string]$d,[int]$rno){
+  $m=([datetime]$d).AddDays(-400).ToString('yyyy-MM-dd')
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  $flag=@{}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $r=Invoke-Rows "SELECT TOP 1 CASE WHEN k.四コーナー=1 THEN 1 WHEN CAST(k.四コーナー AS float)/f.fld<=0.33 THEN 2 WHEN CAST(k.四コーナー AS float)/f.fld<=0.66 THEN 3 ELSE 4 END pst
+      FROM 競走結果 k JOIN #fld f ON f.v=k.開催場所 AND f.dd=k.開催日 AND f.rr=k.レース番号
+      WHERE k.馬名=@h AND k.開催日<@d AND k.開催日>=@m AND k.四コーナー>0 AND k.着順>0
+      ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d;'@m'=$m}
+    $flag[$h]= if($r.Count -gt 0 -and $r[0].pst -isnot [DBNull]){[int]$r[0].pst}else{$null} }
+  return $flag
+}
+
+# 遠征(関東⇄関西)×馬体重: 調教師所属が反対地区の場で出走し馬体重が大幅マイナス(-10kg〜)=相手として割引。
+#   検証([[jra-ensei-weight]]): 遠征馬の複勝率は維持/微増24-26% vs 大幅減-10〜が16-20%・全年(2022-26)頑健。
+#   方向は西→東(関西馬の関東遠征)が強・東→西弱(西高東低)。回収率は全帯62-84%で織込済=妙味でなく確度/危険ラベル向け。
+#   ※馬体重増減は当日発表(パドック)後のみ取得可→前日カードでは空=未適用(自動スキップ)。北海道(札幌/函館)は東西遠征の定義外。
+#   馬名->'遠危'(遠征×-10kg〜=相手割引) / '遠'(遠征だが体重未発表or維持〜微減=情報のみ) / 未収載(地元)
+function Compute-EnseiWeight($v,$d,$rno){
+  $east=@('東京','中山','福島','新潟'); $west=@('阪神','京都','中京','小倉')
+  $reg= if($east -contains $v){'E'} elseif($west -contains $v){'W'} else {''}
+  $map=@{}
+  if($reg -eq ''){ return $map }   # 北海道開催は東西遠征の対象外
+  foreach($x in (Invoke-Rows "SELECT 馬名,調教師所属,馬体重増減 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno})){
+    $h=[string]$x.馬名; $aff=[string]$x.調教師所属
+    $ensei = ($aff -eq '東' -and $reg -eq 'W') -or ($aff -eq '西' -and $reg -eq 'E')
+    if(-not $ensei){ continue }
+    $dw=$null
+    if($x.馬体重増減 -isnot [DBNull]){ $t=0; if([int]::TryParse(([string]$x.馬体重増減).Trim(),[ref]$t)){ $dw=$t } }
+    if($null -ne $dw -and $dw -le -10){ $map[$h]='遠危' } else { $map[$h]='遠' }
+  }
+  return $map
+}
+
+# 休み明け(中8週+=前走間隔56日以上)×馬体重マイナス(-6kg以上減)=相手として消し・軸割引。
+#   検証([[jra-layoff-weight]]): 休明の複勝率は維持0kg23.1%/増21.9% vs 減-6~9が18.9%・減-10~が15.0%(勝率4.8)で減るほど単調悪化・全5年頑健。
+#   休み明け固有(通常2-7週の-6kg減は複勝22.4%で平常)。放牧明けで実が減=調整不足/細化。単勝回収56%で過剰人気=消す実益あり(織込済でなく妙味)。買い側は無し。
+#   ※前走間隔はLAGで事前算出可だが、馬体重増減は当日パドック発表後のみ→前日カードでは'休消'は付かず'休'(間隔のみ)。馬名->'休消'(休明×-6kg〜) / '休'(休明だが体重OK or未発表)
+function Compute-LayoffWeight($v,$d,$rno){
+  $map=@{}
+  $rows=Invoke-Rows "SELECT e.馬名, TRY_CAST(e.馬体重増減 AS int) dw,
+      DATEDIFF(day,(SELECT MAX(p.開催日) FROM レース情報 p WHERE p.馬名=e.馬名 AND p.開催日<@d),@d) gap
+    FROM レース情報 e WHERE e.開催場所=@v AND e.開催日=@d AND e.レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($x in $rows){
+    $h=[string]$x.馬名
+    if($x.gap -is [DBNull]){ continue }     # 前走なし(初出走/データ内初出)
+    if([int]$x.gap -lt 56){ continue }       # 休み明けでない(中8週未満)
+    $dw=$null; if($x.dw -isnot [DBNull]){ $dw=[int]$x.dw }
+    if($null -ne $dw -and $dw -le -6){ $map[$h]='休消' } else { $map[$h]='休' }
+  }
+  return $map
+}
+
+# 馬体重大幅増(前走比+8kg以上)=軸割引(過剰人気)。検証([[jra-meeting-rotation]] 2026-06-27 rota_ev): 大幅増≥+8は
+#   コンピ順位固定でも複勝最低(コ1で60.4% vs 横ばい63.5%)かつ単勝回収63.5%(最低)=市場が過剰人気=軸不適。+EVでなく軸の危険ラベル。
+#   ※馬体重増減は当日パドック発表後のみ→前日カードでは付かない(自動スキップ)。馬名->bool。
+function Compute-WeightGain($v,$d,$rno,$thresh){
+  $map=@{}
+  foreach($x in (Invoke-Rows "SELECT 馬名,TRY_CAST(馬体重増減 AS int) dw FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno})){
+    if($x.dw -isnot [DBNull] -and [int]$x.dw -ge $thresh){ $map[[string]$x.馬名]=$true }
+  }
+  return $map
+}
+
+# 前々走→前走→今走の変遷シグナル(軸=コンピ1位で検証[[jra-axis-trajectory]]・複勝率はコンピ順位制御後の増分)。
+#   ★確度(◎/○に付記): 連好=前々走・前走とも3着以内(複66-68%・全年頑健) / 降2=2クラス以上下げて出走(複65-77%・全年)
+#   ★消し(割引注記): 失速=前走6着以下だが前々走は3着以内(複51-53%・22-24) / ダ替=前走芝→今走ダ(複50-56%・22-24)
+#   +EVは無し=確度/危険ラベル用。前走間隔/着順は前日でも算出可(体重と違い当日発表不要)。馬名->フラグ連結文字列(例'連好降2')
+function Compute-TrajFlags($v,$d,$rno){
+  $map=@{}
+  $tr=Invoke-Rows "SELECT TOP 1 条件,コース種別 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  if($tr.Count -eq 0){ return $map }
+  $clsOf={ param($j) switch -Regex ("$j"){ '3勝クラス'{3;break} '2勝クラス'{2;break} '1勝クラス'{1;break} 'オープン|リステッド|\(G'{4;break} '未勝利|新馬'{0;break} default{-1} } }
+  $tCls=& $clsOf $tr[0].条件; $tSurf=[string]$tr[0].コース種別
+  foreach($e in (Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno})){
+    $h=[string]$e.馬名
+    $pv=Invoke-Rows "SELECT TOP 2 TRY_CAST(着順 AS int) rk,条件,コース種別 FROM レース情報 WHERE 馬名=@h AND 開催日<@d AND TRY_CAST(着順 AS int)>0 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    if($pv.Count -lt 2){ continue }
+    $rk1=[int]$pv[0].rk; $rk2=[int]$pv[1].rk
+    $pCls=& $clsOf $pv[0].条件; $pSurf=[string]$pv[0].コース種別
+    $fl=@()
+    if($rk1 -le 3 -and $rk2 -le 3){ $fl+='連好' }                                   # 確度
+    if($tCls -ge 0 -and $pCls -ge 0 -and $tCls -le ($pCls-2)){ $fl+='降2' }          # 確度(2クラス以上格下げ)
+    if($rk1 -ge 6 -and $rk2 -le 3){ $fl+='失速' }                                   # 消し(前走で崩れた人気馬)
+    if($pSurf -eq '芝' -and $tSurf -eq 'ダ'){ $fl+='ダ替' }                          # 消し(芝→ダ替わり)
+    if($fl.Count -gt 0){ $map[$h]=($fl -join '') }
+  }
+  return $map
+}
+
+# 前々走×前走の「内容一貫性」(検証[[jra-course-agari]]・上り順位はレース内RANK相対/位置は四角通過率)。
+#   ★確度: 連脚=2走連続で前付け(四角前1/3)×上り上位(レース内3位内)=今走複勝50%級・全年頑健 / 連上=2走連続上り上位(複37%)
+#   ★消し: 連後=2走連続後方(四角後1/3)=複7-10%・全年頑健・単回収51-62%割れ(過剰人気で消す実益)
+#   一貫レベルが変遷より効く。馬名->'連脚'/'連上'/'連後'/''
+function Compute-Consistency($v,$d,$rno){
+  $map=@{}
+  $rows=Invoke-Rows @"
+WITH ent AS (SELECT DISTINCT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r),
+hh AS (SELECT k.馬名,k.開催場所 vv,k.開催日 dd,k.レース番号 rr,ROW_NUMBER() OVER(PARTITION BY k.馬名 ORDER BY k.開催日 DESC,k.レース番号 DESC) rn
+ FROM 競走結果 k WHERE k.馬名 IN(SELECT 馬名 FROM ent) AND k.開催日<@d AND TRY_CAST(k.着順 AS int)>0),
+keys AS (SELECT DISTINCT vv,dd,rr FROM hh WHERE rn<=2),
+fc AS (SELECT 開催場所 vv,開催日 dd,レース番号 rr,COUNT(*) c FROM 競走結果 WHERE 着順>0 GROUP BY 開催場所,開催日,レース番号),
+rk AS (SELECT k.開催場所 vv,k.開催日 dd,k.レース番号 rr,k.馬名,
+   RANK() OVER(PARTITION BY k.開催場所,k.開催日,k.レース番号 ORDER BY CASE WHEN TRY_CAST(k.上り3F AS float)>0 THEN TRY_CAST(k.上り3F AS float) ELSE 9999 END) ar,
+   CASE WHEN fc.c>0 THEN 1.0*TRY_CAST(k.四コーナー AS int)/fc.c END pos
+ FROM 競走結果 k JOIN keys ON keys.vv=k.開催場所 AND keys.dd=k.開催日 AND keys.rr=k.レース番号 JOIN fc ON fc.vv=k.開催場所 AND fc.dd=k.開催日 AND fc.rr=k.レース番号)
+SELECT hh.馬名,MAX(CASE WHEN hh.rn=1 THEN rk.ar END) ar1,MAX(CASE WHEN hh.rn=2 THEN rk.ar END) ar2,
+  MAX(CASE WHEN hh.rn=1 THEN rk.pos END) pos1,MAX(CASE WHEN hh.rn=2 THEN rk.pos END) pos2
+FROM hh JOIN rk ON rk.vv=hh.vv AND rk.dd=hh.dd AND rk.rr=hh.rr AND rk.馬名=hh.馬名 WHERE hh.rn<=2 GROUP BY hh.馬名
+"@ @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($x in $rows){
+    $h=[string]$x.馬名
+    if($x.ar1 -is [DBNull] -or $x.ar2 -is [DBNull]){ continue }   # 2走そろわない
+    $ar1=[int]$x.ar1; $ar2=[int]$x.ar2
+    $p1= if($x.pos1 -isnot [DBNull]){[double]$x.pos1}else{$null}
+    $p2= if($x.pos2 -isnot [DBNull]){[double]$x.pos2}else{$null}
+    $conUp=($ar1 -le 3 -and $ar2 -le 3)
+    $conFront=($null -ne $p1 -and $null -ne $p2 -and $p1 -le 0.33 -and $p2 -le 0.33)
+    $conBack=($null -ne $p1 -and $null -ne $p2 -and $p1 -gt 0.66 -and $p2 -gt 0.66)
+    if($conBack){ $map[$h]='連後' } elseif($conUp -and $conFront){ $map[$h]='連脚' } elseif($conUp){ $map[$h]='連上' }
+  }
+  return $map
+}
+
+# 前走→今走のコースローテ割引([[jra-meeting-rotation]]・全場2022-25で年別頑健)。
+#   ★距離延長(+200m以上)=全10場・全年で複勝率-4〜-10pt(同距26→延長17-20)。延長幅大ほど割引。
+#   ★遠征(前走別場)=同場継続有利な場(東京-4.2/中京-3.8/小倉-2.7/中山-2.2)でのみ割引。京都/阪神/函館/福島は差なし。
+#   確度/危険ラベル用(単回収は織込済の公算)。馬名->'延'/'遠'/'延遠'/''
+function Compute-RotaFlags($v,$d,$rno){
+  $map=@{}
+  $sameAdvVenues=@('東京','中京','小倉','中山')   # 同場継続有利=遠征割引が頑健な場
+  $rows=Invoke-Rows @"
+WITH ent AS (SELECT 馬名,TRY_CAST(距離 AS int) td FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r),
+prev AS (SELECT k.馬名,k.開催場所 pv,TRY_CAST(k.距離 AS int) pd,
+   ROW_NUMBER() OVER(PARTITION BY k.馬名 ORDER BY k.開催日 DESC,k.レース番号 DESC) rn
+ FROM レース情報 k WHERE k.馬名 IN(SELECT 馬名 FROM ent) AND k.開催日<@d AND TRY_CAST(k.着順 AS int)>0)
+SELECT e.馬名,e.td,p.pv,p.pd FROM ent e JOIN prev p ON p.馬名=e.馬名 AND p.rn=1
+"@ @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($x in $rows){
+    $h=[string]$x.馬名
+    if($x.td -is [DBNull] -or $x.pd -is [DBNull]){ continue }
+    $td=[int]$x.td; $pd=[int]$x.pd; $pv=[string]$x.pv; $fl=@()
+    if($td-$pd -ge 200){ $fl+='延' }                                       # 距離延長=全場割引
+    if(($sameAdvVenues -contains $v) -and $pv -ne $v){ $fl+='遠' }          # 同場有利場での遠征=割引
+    if($fl.Count -gt 0){ $map[$h]=($fl -join '') }
+  }
+  return $map
+}
+
+# 昨年同開催の「好走馬プロファイル」への近さをスコア化([[jra-meeting-rotation]])。軸フィルタに組込む(W_rotaで総合へ加点)。
+#   方法: 今走と同場・同種別・同距離帯(±200m)で昨年同時期(今走日-1年±28日)に走った馬を、前走ローテ(短縮/同/延長)×前走同場/別場の6バケットに分け、各バケットの複勝率を算出。
+#   今走各馬を自分のローテバケットに割当て、その昨年複勝率=「昨年の好走馬にどれだけ似たローテか」を返す(0-100)。高い=昨年好走したのと近いローテ。
+#   着順/能力でなくローテ次元のみ(総合の能力評価と二重計上を避ける)。参照不足(<25)はスキップ。馬名->score
+function Compute-LastYearMatch($v,$d,$rno){
+  $map=@{}
+  try {
+    $dt=[datetime]$d
+    $ly0=$dt.AddYears(-1).AddDays(-28).ToString('yyyy-MM-dd'); $ly1=$dt.AddYears(-1).AddDays(28).ToString('yyyy-MM-dd')
+    $ent=Invoke-Rows "SELECT nm,surf,dist,v1,dist1 FROM dbo.xrot WHERE v=@v AND d=@d AND r=@r AND v1 IS NOT NULL AND dist1>0" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+    if(-not $ent -or @($ent).Count -eq 0){ return $map }
+    $surf=[string]@($ent)[0].surf; $dist=[int]@($ent)[0].dist
+    $ref=Invoke-Rows @"
+SELECT CASE WHEN dist1-dist>=200 THEN 'S' WHEN dist-dist1>=200 THEN 'L' ELSE 'E' END rota,
+  CASE WHEN v1=@v THEN 1 ELSE 0 END same,COUNT(*) n,100.0*AVG(CASE WHEN rk<=3 THEN 1.0 ELSE 0 END) f
+FROM dbo.xrot WHERE v=@v AND surf=@surf AND d>=@ly0 AND d<=@ly1 AND v1 IS NOT NULL AND rk>0 AND dist1>0 AND dist BETWEEN @dlo AND @dhi
+GROUP BY CASE WHEN dist1-dist>=200 THEN 'S' WHEN dist-dist1>=200 THEN 'L' ELSE 'E' END,CASE WHEN v1=@v THEN 1 ELSE 0 END
+"@ @{'@v'=$v;'@surf'=$surf;'@ly0'=$ly0;'@ly1'=$ly1;'@dlo'=($dist-200);'@dhi'=($dist+200)}
+    $bdict=@{}; $sumF=0.0; $sumN=0
+    foreach($rr in $ref){ $nn=[int]$rr.n; $ff=[double]$rr.f; $sumF+=$ff*$nn; $sumN+=$nn; if($nn -ge 6){ $bdict["$($rr.rota)|$($rr.same)"]=$ff } }
+    if($sumN -lt 25){ return $map }    # 昨年同条件の参照不足はスキップ(ノイズ回避)
+    $base=$sumF/$sumN
+    foreach($e in @($ent)){
+      $td=[int]$e.dist; $pd=[int]$e.dist1
+      $r= if($pd-$td -ge 200){'S'}elseif($td-$pd -ge 200){'L'}else{'E'}
+      $sm= if([string]$e.v1 -eq $v){1}else{0}
+      $bk="$r|$sm"
+      $sc= if($bdict.ContainsKey($bk)){$bdict[$bk]}else{$base}
+      $map[[string]$e.nm]=[Math]::Round($sc,0)
+    }
+  } catch { return @{} }
+  return $map
+}
+
+# 騎手乗り替わり判定([[keiba-jockey-switch]][[keiba-universal-signals]])。今走騎手≠前走騎手=乗替。穴×地力との交差は呼出側/オフラインで。馬名->1
+function Compute-JockeySwitch($v,$d,$rno){
+  $map=@{}
+  try {
+    $rows=Invoke-Rows @"
+WITH ent AS (SELECT 馬名,騎手 tj FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r),
+prev AS (SELECT k.馬名,k.騎手 pj,ROW_NUMBER() OVER(PARTITION BY k.馬名 ORDER BY k.開催日 DESC,k.レース番号 DESC) rn
+ FROM レース情報 k WHERE k.馬名 IN(SELECT 馬名 FROM ent) AND k.開催日<@d AND TRY_CAST(k.着順 AS int)>0)
+SELECT e.馬名,e.tj,p.pj FROM ent e JOIN prev p ON p.馬名=e.馬名 AND p.rn=1
+"@ @{'@v'=$v;'@d'=$d;'@r'=$rno}
+    foreach($x in $rows){ $tj=[string]$x.tj; $pj=[string]$x.pj
+      if($tj -ne '' -and $pj -ne '' -and $tj -ne $pj){ $map[[string]$x.馬名]=1 } }
+  } catch { return @{} }
+  return $map
+}
+
+try {
+  $lo=([datetime]$Date).AddDays(-800).ToString('yyyy-MM-dd')
+  # 前残り場の先行力重み(自動): 検証済=函館。他の前残り場は各場で検証後に追加。
+  $frontVenues=@('函館')
+  if($W_front -lt 0){ $W_front= if($frontVenues -contains $Venue){0.20}else{0.0} }
+  # 差し有利場(前型本命を割引): 検証済=東京([[tokyo-basics]])。前残り場(函館等)とは逆向き。
+  $sashiVenues=@('東京')
+  $isSashi = $sashiVenues -contains $Venue
+  # レース別頭数(先行力/前走脚質の位置率分母用)を一時テーブルに(接続内で再利用)。先行力場 or 差し場で必要。
+  if($W_front -gt 0 -or $isSashi){ [void](Invoke-Rows "IF OBJECT_ID('tempdb..#fld') IS NOT NULL DROP TABLE #fld; SELECT 開催場所 v,開催日 dd,レース番号 rr,COUNT(*) fld INTO #fld FROM 競走結果 WHERE 着順>0 AND 四コーナー>0 GROUP BY 開催場所,開催日,レース番号" @{}) }
+  # V3行
+  $v3sql=Get-Content (Join-Path $PSScriptRoot 'danwa-v3-rows.sql') -Raw -Encoding UTF8
+  $v3rows=Invoke-Rows $v3sql @{'@date'=$Date;'@venue'=$Venue;'@lo'=$lo}
+  $V3=@{}; foreach($x in $v3rows){ $V3["$([int]$x.レース番号)|$([int]$x.馬番)"]=$x }
+  # コンピ(順位 + 指数値)
+  $cp=@{}; $cpv=@{}; foreach($x in (Invoke-Rows "SELECT レース番号,馬番,指数,指数順位 FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY レース番号,馬番 ORDER BY 取得日時 DESC) rn FROM コンピ指数 WHERE 開催日=@d AND 開催場所=@v) t WHERE rn=1" @{'@d'=$Date;'@v'=$Venue})){ $k="$([int]$x.レース番号)|$([int]$x.馬番)"; $cp[$k]=[int]$x.指数順位; if($x.指数 -isnot [DBNull]){ $cpv[$k]=[int]$x.指数 } }
+  # 人気
+  $pop=@{}; foreach($x in (Invoke-Rows "SELECT レース番号,馬番,人気 FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY レース番号,馬番 ORDER BY 日時 DESC) rn FROM リアルタイムオッズ WHERE 開催日=@d AND 開催場所=@v) t WHERE rn=1" @{'@d'=$Date;'@v'=$Venue})){ if($x.人気 -isnot [DBNull]){ $pop["$([int]$x.レース番号)|$([int]$x.馬番)"]=[int]$x.人気 } }
+
+  $races=@(); foreach($x in (Invoke-Rows "SELECT DISTINCT レース番号 FROM レース情報 WHERE 開催日=@d AND 開催場所=@v ORDER BY レース番号" @{'@d'=$Date;'@v'=$Venue})){ $races+=[int]$x.レース番号 }
+  Write-Host ("=== JRA統合カード {0} {1}  (h2h{2}/V3 {3}/コンピ{4} レース内Z合成) ===" -f $Date,$Venue,$W_h2h,$W_v3,$W_compi)
+  foreach($rno in $races){
+    $ent=Invoke-Rows "SELECT 馬番,馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r ORDER BY 馬番" @{'@v'=$Venue;'@d'=$Date;'@r'=$rno}
+    if($ent.Count -eq 0){ continue }
+    $h2h=Compute-H2h $Venue $Date $rno
+    $distRows=Invoke-Rows "SELECT TOP 1 距離,コース種別,条件,発走時刻,競走名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$Venue;'@d'=$Date;'@r'=$rno}
+    $dist= if($distRows.Count -gt 0 -and $distRows[0].距離 -isnot [DBNull]){[int]$distRows[0].距離}else{0}
+    $surf= if($distRows.Count -gt 0){[string]$distRows[0].コース種別}else{''}
+    $jouken= if($distRows.Count -gt 0){[string]$distRows[0].条件}else{''}
+    $post= if($distRows.Count -gt 0 -and $distRows[0].発走時刻 -isnot [DBNull]){[datetime]$distRows[0].発走時刻}else{$null}
+    $raceName= if($distRows.Count -gt 0){[string]$distRows[0].競走名}else{''}
+    $todayCls= switch -Regex ($jouken){ '3勝クラス'{3;break} '2勝クラス'{2;break} '1勝クラス'{1;break} 'オープン'{4;break} '未勝利|新馬'{0;break} default{-1} }
+    $agari=Compute-AgariFlag $Venue $Date $rno $surf
+    $danger=Compute-DangerFlag $Venue $Date $rno $todayCls
+    $cdrop=Compute-CompiDrop $Venue $Date $rno
+    $cdec2=Compute-CompiDecline2 $Venue $Date $rno
+    $cstab=Compute-CompiStable $Venue $Date $rno
+    $crise=Compute-CompiRise $Venue $Date $rno
+    $cymom=Compute-CyokyoMom $Venue $Date $rno
+    $dtrend=Compute-DanwaTrend $Venue $Date $rno
+    $front= if($W_front -gt 0){ Compute-FrontStyle $Venue $Date $rno }else{ @{} }
+    $pstyle= if($isSashi){ Compute-PrevStyle $Venue $Date $rno }else{ @{} }
+    $ensei= Compute-EnseiWeight $Venue $Date $rno   # 遠征(関東⇄関西)×馬体重: 相手割引用([[jra-ensei-weight]])
+    $layoff= Compute-LayoffWeight $Venue $Date $rno # 休み明け(中8週+)×馬体重減: 相手消し用([[jra-layoff-weight]])
+    $wgain= Compute-WeightGain $Venue $Date $rno $WeightGainThresh # 馬体重大幅増(+8kg〜)×軸=過剰人気割引([[jra-meeting-rotation]])
+    $traj= Compute-TrajFlags $Venue $Date $rno      # 着順/クラス/コース変遷(確度:連好/降2・消し:失速/ダ替)[[jra-axis-trajectory]]
+    $cons= Compute-Consistency $Venue $Date $rno    # 前々走×前走の内容一貫(確度:連脚/連上・消し:連後)[[jra-course-agari]]
+    $rota= Compute-RotaFlags $Venue $Date $rno      # コースローテ割引(延長=全場・遠征=東中小中山)[[jra-meeting-rotation]]
+    $lym= if($W_rota -ne 0){ Compute-LastYearMatch $Venue $Date $rno }else{ @{} }  # 昨年同開催の好走馬プロファイル合致度(軸ブースト)
+    $jsw= Compute-JockeySwitch $Venue $Date $rno   # 騎手乗り替わり(穴×地力で乗替穴軸シグナル)[[keiba-universal-signals]]
+    $h2hMap=@{}; $v3Map=@{}; $cpMap=@{}; $frMap=@{}; $simMap=@{}
+    foreach($e in $ent){ $u=[int]$e.馬番; $nm=[string]$e.馬名; $key="$rno|$u"
+      if($h2h.ContainsKey($nm)){ $h2hMap[$u]=[double]$h2h[$nm] }
+      if($V3.ContainsKey($key)){ $v3Map[$u]=[double]$V3[$key].v3 }
+      if($cp.ContainsKey($key)){ $cpMap[$u]= -1.0*$cp[$key] }   # 指数順位は小さいほど良い→符号反転
+      if($front.ContainsKey($nm) -and $front[$nm].np -ge 2 -and $null -ne $front[$nm].lead){ $frMap[$u]=[double]$front[$nm].lead }
+      if($lym.ContainsKey($nm)){ $simMap[$u]=[double]$lym[$nm] }
+    }
+    $zh=ZMap $h2hMap; $zv=ZMap $v3Map; $zc=ZMap $cpMap; $zf=ZMap $frMap; $zr=ZMap $simMap
+    $out=foreach($e in $ent){ $u=[int]$e.馬番; $nm=[string]$e.馬名; $key="$rno|$u"
+      $parts=@(); $tot=0.0
+      if($zh.ContainsKey($u)){ $tot+=$W_h2h*$zh[$u]; $parts+='h' }
+      if($zv.ContainsKey($u)){ $tot+=$W_v3*$zv[$u]; $parts+='v' }
+      if($zc.ContainsKey($u)){ $tot+=$W_compi*$zc[$u]; $parts+='c' }
+      if($zf.ContainsKey($u)){ $tot+=$W_front*$zf[$u]; $parts+='f' }
+      if($zr.ContainsKey($u)){ $tot+=$W_rota*$zr[$u]; $parts+='r' }   # 昨年好走プロファイル合致度ブースト([[jra-meeting-rotation]])
+      $lead= if($front.ContainsKey($nm)){$front[$nm].lead}else{$null}
+      $np= if($front.ContainsKey($nm)){$front[$nm].np}else{0}
+      $senStyle= if($null -eq $lead -or $np -lt 2){''} elseif($lead -ge 0.7){'逃'} elseif($lead -ge 0.45){'先'} elseif($lead -ge 0.2){'差'} else {'追'}
+      $keshi= if($V3.ContainsKey($key)){[int]$V3[$key].消し}else{0}
+      [PSCustomObject]@{ 馬番=$u; 馬名=$nm.Substring(0,[Math]::Min(8,$nm.Length))
+        総合= if($parts.Count -gt 0){[Math]::Round($tot,2)}else{$null}
+        h2h= if($h2hMap.ContainsKey($u)){[Math]::Round($h2hMap[$u],2)}else{''}
+        V3= if($V3.ContainsKey($key)){[int]$V3[$key].v3}else{''}
+        コンピ= if($cp.ContainsKey($key)){$cp[$key]}else{''}
+        指= if($cpv.ContainsKey($key)){$cpv[$key]}else{''}
+        印= if($V3.ContainsKey($key)){[string]$V3[$key].印}else{''}
+        矢= if($V3.ContainsKey($key)){[string]$V3[$key].矢印}else{''}
+        人気= if($pop.ContainsKey($key)){$pop[$key]}else{''}
+        末= if($agari.ContainsKey($nm)){[string]$agari[$nm]}else{''}
+        危= if($danger.ContainsKey($nm) -and $danger[$nm]){'危'}else{''}
+        格= if($cdrop.ContainsKey($nm) -and $cdrop[$nm]){'格'}else{''}
+        降= if($cdec2.ContainsKey($nm) -and $cdec2[$nm]){'降'}else{''}
+        安= if($cstab.ContainsKey($nm)){[string]$cstab[$nm]}else{''}
+        信= if($crise.ContainsKey($nm) -and $crise[$nm]){'信'}else{''}
+        調= if($cymom.ContainsKey($nm) -and $cymom[$nm].sneg){'調'}else{''}
+        話= if($dtrend.ContainsKey($nm) -and $dtrend[$nm]){'悪'}else{''}
+        _up3= if($cymom.ContainsKey($nm)){[int]$cymom[$nm].up3}else{0}
+        人危= if($pop.ContainsKey($key) -and "$($pop[$key])" -ne '' -and [int]$pop[$key] -le 2 -and $cp.ContainsKey($key) -and [int]$cp[$key] -ge 4){'▼人'}else{''}
+        先=$senStyle; _lead=$lead; _np=$np
+        前= if($pstyle.ContainsKey($nm) -and $null -ne $pstyle[$nm]){ switch([int]$pstyle[$nm]){1{'逃'}2{'先'}3{'差'}4{'追'}} }else{''}
+        _pst= if($pstyle.ContainsKey($nm)){$pstyle[$nm]}else{$null}
+        遠= if($ensei.ContainsKey($nm)){[string]$ensei[$nm]}else{''}
+        休= if($layoff.ContainsKey($nm)){[string]$layoff[$nm]}else{''}
+        増= if($wgain.ContainsKey($nm)){$true}else{$false}
+        遷= if($traj.ContainsKey($nm)){[string]$traj[$nm]}else{''}
+        連= if($cons.ContainsKey($nm)){[string]$cons[$nm]}else{''}
+        路= if($rota.ContainsKey($nm)){[string]$rota[$nm]}else{''}
+        似= if($lym.ContainsKey($nm)){[int]$lym[$nm]}else{''}
+        乗= if($jsw.ContainsKey($nm)){1}else{0}
+        消=$keshi }
+    }
+    # ラベル: 消し優先、上位を軸/相手
+    $ranked=@($out | Sort-Object { if($null -eq $_.総合){-999}else{$_.総合} } -Descending)
+    # ★軸足切り(コンピ上位N=既定3)[[keiba-axis-method-comparison]] 2026-06-27検証: 総合軸のコンピ順位が低いほど複勝激減(コ4-5:35%/コ6+:17% vs コ1-3:43-69%・全5年頑健)。
+    #   総合1位のコンピ順位がAxisCapRankより下(=4位以下)なら、コンピ上位N内の総合最上位を軸に差し替え(非突出時の中位軸救済)。-NoAxisCapで無効。
+    if(-not $NoAxisCap -and $ranked.Count -ge 2 -and $null -ne $ranked[0].総合 -and $ranked[0].消 -ne 1){
+      $hc= if("$($ranked[0].コンピ)" -match '^\d+$'){[int]$ranked[0].コンピ}else{99}
+      if($hc -gt $AxisCapRank){
+        $alt=@($ranked | Where-Object { "$($_.コンピ)" -match '^\d+$' -and [int]$_.コンピ -le $AxisCapRank -and $_.消 -ne 1 -and $null -ne $_.総合 } | Select-Object -First 1)
+        if($alt.Count -ge 1){
+          $au=$alt[0].馬番
+          $alt[0] | Add-Member -NotePropertyName 足切 -NotePropertyValue $true -Force
+          $ranked=@($alt[0]) + @($ranked | Where-Object { $_.馬番 -ne $au })
+        }
+      }
+    }
+    $simList=@($ranked | Where-Object { $_.似 -ne '' } | ForEach-Object { [int]$_.似 })
+    $simMax= if($simList.Count -gt 0){ ($simList | Measure-Object -Maximum).Maximum }else{ 0 }   # 昨年好走プロファイル最高合致(似◎用)
+    $simMin= if($simList.Count -gt 0){ ($simList | Measure-Object -Minimum).Minimum }else{ 0 }
+    $rank=0
+    $ranked=foreach($o in $ranked){ $rank++
+      $star= ($o.末 -eq '★')
+      $lab= if($o.消 -eq 1){'消'}
+        elseif($rank -eq 1 -and $null -ne $o.総合){ if($star -and $dist -ge 1600){'◎堅軸'} elseif($star){'◎軸★'} else {'◎軸'} }
+        elseif($rank -le 3 -and $null -ne $o.総合){ if($star){'○相手★'}else{'○相手'} }
+        elseif($rank -le 5 -and $null -ne $o.総合){'△'} else {''}
+      # 危険軸(前走2秒負け・非格上)は本命/相手から格下げ: ◎系→注危 / ○系→△危
+      if($o.危 -eq '危' -and $o.消 -ne 1){
+        $lab= if($lab -like '◎*'){'注危'} elseif($lab -like '○*'){'△危'} elseif($lab -ne ''){"${lab}危"} else {'危'}
+      }
+      # 遠征(関東⇄関西)×馬体重大幅減(-10kg〜)=相手を絞る際の割引。○相手→△遠に格下げ(相手から外す)、◎軸には▽遠注記のみ。
+      #   検証([[jra-ensei-weight]]): 遠征の大幅減は複勝16-20%(維持/微増24-26%)・全年頑健。回収妙味でなく確度/危険。当日体重発表後のみ作動。
+      if($o.遠 -eq '遠危' -and $o.消 -ne 1){
+        $lab= if($lab -like '○*'){'△遠'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽遠"} elseif($lab -eq '△'){'△遠'} else {$lab} }
+      # 休み明け(中8週+)×馬体重減(-6kg〜)=相手を絞る際の消し。○相手→△休に格下げ、◎軸→▽休注記のみ。
+      #   検証([[jra-layoff-weight]]): 休明×減-6〜は複勝17-19%(減-10〜15%)・全5年で他より-3〜7pt・単回収56%で過剰人気(消す実益)。当日体重発表後のみ作動。
+      if($o.休 -eq '休消' -and $o.消 -ne 1){
+        $lab= if($lab -like '○*'){'△休'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽休"} elseif($lab -eq '△'){'△休'} else {$lab} }
+      # 馬体重大幅増(+8kg〜)=軸の過剰人気割引([[jra-meeting-rotation]] rota_ev: コ1複勝60.4%/単回収63.5%=最低)。◎軸→▽増注記のみ(相手は据置=複勝率低下が小さいため軸の妙味警告に限定)。当日体重発表後のみ。
+      if($o.増 -and $o.消 -ne 1 -and $lab -like '◎*' -and $lab -notlike '*危*'){ $lab="${lab}▽増" }
+      # 軸足切り(コンピ上位3)で総合1位から差し替えた軸=印に注記(総合1位がコンピ4位以下だったため)。
+      if($o.足切 -and $lab -like '◎*'){ $lab="${lab}・コ足切" }
+      # 前々走→前走→今走の変遷(確度/危険)[[jra-axis-trajectory]]。確度=連好/降2は◎/○に付記、消し=失速/ダ替は割引注記(危時は付けない)。
+      if(($lab -like '◎*' -or $lab -like '○*') -and $lab -notlike '*危*'){
+        if($o.遷 -like '*連好*'){ $lab="${lab}連好" }                                 # 確度:前々走前走とも3着内
+        if($o.遷 -like '*降2*'){ $lab="${lab}降2" }                                   # 確度:2クラス以上格下げ
+        if($o.遷 -like '*失速*'){ $lab="${lab}▽失速" }                                # 消し:前走で崩れた人気馬
+        if($o.遷 -like '*ダ替*'){ $lab="${lab}▽ダ替" }                                # 消し:芝→ダ替わり
+        # 前々走×前走の内容一貫([[jra-course-agari]])。連脚(連続前+上り上位)/連上(連続上り上位)=確度、連後=消し
+        if($o.連 -eq '連脚'){ $lab="${lab}連脚" } elseif($o.連 -eq '連上'){ $lab="${lab}連上" }
+        if($o.連 -eq '連後'){ $lab="${lab}▽連後" }
+        # コースローテ割引([[jra-meeting-rotation]])。延長=全場で複-4〜10pt、遠征=東中小中山で複-2〜4pt
+        if($o.路 -like '*延*'){ $lab="${lab}▽延" }
+        if($o.路 -like '*遠*'){ $lab="${lab}▽遠ロ" }
+        # 昨年同開催の好走馬に最も近いローテ(=好走馬プロファイル合致が場内最高かつ最低と8pt以上差)を炙り出し([[jra-meeting-rotation]])
+        if($o.似 -ne '' -and [int]$o.似 -eq $simMax -and ($simMax-$simMin) -ge 8){ $lab="${lab}似◎" }
+      }
+      # コンピ大幅下降(格上挑戦)の◎軸は割引注記(完全格下げでなく◎軸格)。検証=コンピ1位でも格上挑戦だと一段弱い
+      if($o.格 -eq '格' -and $lab -like '◎*' -and $lab -notlike '*危*'){ $lab="${lab}格" }
+      # 人気先行・コンピ不在(人気1-2番だが指数4位以下)=軸危険の警告付記。全場頑健(東京/中山/阪神/京都=勝率~17%/複~48% vs 一致~30%/~62%)。◎/○の市場過剰人気の罠を明示([[hanshin-basics]])
+      if($o.人危 -ne '' -and $o.消 -ne 1 -and ($lab -like '◎*' -or $lab -like '○*')){ $lab="${lab}▼人" }
+      # コンピ指数の絶対水準で本命を強/弱注記(検証: 指数80+で複勝72%, 60台で41%)。危険時は付けない
+      if($lab -like '◎*' -and $lab -notlike '*危*' -and "$($o.指)" -ne ''){
+        if([int]$o.指 -ge 80){ $lab="${lab}強" } elseif([int]$o.指 -le 67){ $lab="${lab}弱" }
+      }
+      # 調教矢印↗(上昇)=本命/相手の確度up。検証: コンピ1位でも↗は勝率+4〜7pt/複勝+3〜6pt・2022-24全年頑健([[jra-comment-axis]])。賭け妙味でなく確度表示
+      # 段階化: 過去3走↗が2回以上なら`↗↗`(持続上昇=単発より強い。今走1位 3回69%/0回61.6%・全band単調)、今走のみ↗は`↗`。
+      if(($lab -like '◎*' -or $lab -like '○*') -and $lab -notlike '*危*'){
+        if([int]$o._up3 -ge 2){ $lab="${lab}↗↗" } elseif($o.矢 -match '↗|↑'){ $lab="${lab}↗" } }
+      # 調教短評ネガ(一杯/促/平凡/物足/案外/余裕等)=◎軸の軽い消し。検証: 今走1位×短評ネガは複勝-3〜5pt・全3年頑健([[jra-comment-axis]])。危/▼降より弱い割引注記
+      if($lab -like '◎*' -and $lab -notlike '*危*' -and $o.降 -ne '降' -and $o.調 -eq '調'){ $lab="${lab}▽調" }
+      # 厩舎の話コメント悪化(前走強気→今走弱気)=◎/○の軽い割引。検証: 強→弱は今走band固定で全band-2〜4pt一貫(コメントのレベル/改善は軸bandで効かず織込=[[jra-comment-axis]])。危/▼降より弱い注記
+      if(($lab -like '◎*' -or $lab -like '○*') -and $lab -notlike '*危*' -and $o.降 -ne '降' -and $o.話 -eq '悪'){ $lab="${lab}▽話" }
+      # コンピ安定上位(前走≤3&今走≤3)=軸/相手の確度ボーナス。◎/○に`安`付記(検証=今走band固定で複勝+3〜7pt・全5年頑健=[[jra-compi-trajectory]]・地方依頼)。降と両立時は降優先で割引
+      if(($lab -like '◎*' -or $lab -like '○*') -and $lab -notlike '*危*' -and $o.降 -ne '降' -and $o.安 -ne ''){ $lab="${lab}$($o.安)" }
+      # コンピ指数2段連続上昇=信頼ボーナス。◎/○に`信`付記(検証=今走1-3位band内で複勝+5〜7pt・全5年頑健=[[keiba-universal-signals]]地方反映)。危/▼降時は付けない
+      if(($lab -like '◎*' -or $lab -like '○*') -and $lab -notlike '*危*' -and $o.降 -ne '降' -and $o.信 -eq '信'){ $lab="${lab}信" }
+      # 2走累積コンピ下降(前々走→今走で-8以上)の◎軸は評価ダウン: 堅軸を外し末尾に▼降(検証=複勝48%/基準63%・全5年で-10〜-19pt頑健=[[jra-compi-trajectory]])
+      if($o.降 -eq '降' -and $lab -like '◎*' -and $lab -notlike '*危*'){ $lab=($lab -replace '堅軸','軸')+'▼降' }
+      # 前残り場の本命の脚質割引(検証: 函館はコンピ1位でも前々型複62.6%>後方型55.0%・全年で符号一貫)。後方型本命は△印で注意
+      if($W_front -gt 0 -and $lab -like '◎*' -and $lab -notlike '*危*' -and $null -ne $o._lead -and $o._np -ge 3 -and $o._lead -lt 0.3){ $lab="${lab}▽後" }
+      # 差し有利場(東京)の本命脚質割引(検証: 東京はコンピ1位でもダ×前走逃で複勝58.5%<ダ基準65%・全年一貫=[[tokyo-basics]])。前残りの逆向き
+      if($isSashi -and $lab -like '◎*' -and $lab -notlike '*危*' -and $surf -eq 'ダ' -and $o._pst -eq 1){ $lab="${lab}▽逃" }
+      $o | Add-Member -NotePropertyName 評価 -NotePropertyValue $lab -PassThru }
+    if($NotifyFull){
+      # 地方競馬(keiba-card-full)同形式: 1レース=ヘッダ(発走時刻つき)＋全頭行。全場の時刻順束ねは jra-card-full.ps1。
+      # ヘッダ行は "●|<ソート用yyyyMMddHHmm>|表示見出し 【券種】" で出力(束ね側がソートキーを剥がす)。
+      $hhmm= if($post){ $post.ToString('HH:mm') }else{ '--:--' }
+      $skey= if($post){ $post.ToString('yyyyMMddHHmm') }else{ '999912312359' }
+      $hd= "{0} {1} {2,2}R {3}m{4} {5}" -f $hhmm,$Venue,$rno,$dist,$surf,$raceName
+      # 振り返り用: 確定着順(馬番→着順)。-WithResult時のみ。
+      $resMap=@{}
+      if($WithResult){ foreach($x in (Invoke-Rows "SELECT 馬番,着順 FROM 競走結果 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r" @{'@d'=$Date;'@v'=$Venue;'@r'=$rno})){ if($x.着順 -isnot [DBNull]){ $resMap[[int]$x.馬番]=[int]$x.着順 } } }
+      Write-Output ("●|{0}|{1}  【三連複 軸1頭流し(相手5)】" -f $skey,$hd.Trim())
+      foreach($o in $ranked){
+        $mk= if($o.評価 -like '◎*' -or $o.評価 -like '注*'){'◎'} elseif($o.評価 -like '○*'){'○'} elseif($o.評価 -like '△*'){'△'} elseif($o.評価 -eq '消'){'消'} else {'　'}
+        $ya= if($o.矢 -match '↗|↑'){'↗'} elseif($o.矢 -match '↘|↓'){'↘'} elseif("$($o.V3)" -ne ''){'→'} else {'・'}
+        $cz= if("$($o.コンピ)" -ne ''){ "ｺﾝﾋﾟ{0}位(指{1})" -f $o.コンピ,$o.指 }else{ 'ｺﾝﾋﾟ-' }
+        $pp= if("$($o.人気)" -ne ''){ " / {0}人気" -f $o.人気 }else{ '' }
+        $fl= ($o.評価 -replace '^(◎|○|▲|△|注|消)','')  # 評価ラベルから印部分を除いた注記(堅軸/危/格/▼降/安/▽調/強/弱/▼人/▽後/▽逃/↗↗)
+        $flnote= if($fl){ " / $fl" }else{ '' }
+        if($WithResult){
+          $ord= if($resMap.ContainsKey([int]$o.馬番)){[int]$resMap[[int]$o.馬番]}else{0}
+          $chk= if($ord -ge 1){ "{0}着" -f $ord }else{ '--' }
+          Write-Output ("  {0,-4} {1}{2} {3,2} {4,-11} {5}{6}{7}" -f $chk,$mk,$ya,$o.馬番,$o.馬名,$cz,$pp,$flnote)
+        } else {
+          Write-Output ("   {0}{1} {2,2} {3,-11} {4}{5}{6}" -f $mk,$ya,$o.馬番,$o.馬名,$cz,$pp,$flnote)
+        }
+      }
+      Write-Output ""
+      continue
+    }
+    if($FunnelDump){
+      # 全頭ダンプ: ネガ/ポジを数え、プール(=ネガ除外→総合上位5→ポジあり)とV3軸を判定し、各馬を1行で出力
+      $sc=@($ranked | ForEach-Object { $o=$_; $rs=@(); $pr=@()
+        if($o.消 -eq 1){$rs+='消'}; if($o.危 -eq '危'){$rs+='危'}; if($o.人危 -ne ''){$rs+='人危'}
+        if($o.遷 -like '*失速*'){$rs+='失速'}; if($o.遷 -like '*ダ替*'){$rs+='ダ替'}; if($o.連 -eq '連後'){$rs+='連後'}
+        if($o.路 -like '*延*'){$rs+='延'}; if($o.路 -like '*遠*'){$rs+='遠'}; if($o.遠 -eq '遠危'){$rs+='遠危'}
+        if($o.休 -eq '休消'){$rs+='休消'}; if($o.降 -ne ''){$rs+='降'}; if($o.調 -ne ''){$rs+='調'}; if($o.話 -ne ''){$rs+='悪'}
+        if($o.遷 -like '*連好*'){$pr+='連好'}; if($o.遷 -like '*降2*'){$pr+='降2'}; if($o.連 -eq '連脚'){$pr+='連脚'}; if($o.連 -eq '連上'){$pr+='連上'}
+        if($o.末 -eq '★'){$pr+='末★'}; if($o.安 -like '*★*'){$pr+='安★'}; if($o.信 -eq '信'){$pr+='信'}
+        if($o.矢 -eq '↗'){$pr+='矢↗'}; if($o.似 -ne '' -and [int]$o.似 -ge 35){$pr+='似'}
+        $o | Add-Member -NotePropertyName _negr -NotePropertyValue ($rs -join '+') -Force
+        $o | Add-Member -NotePropertyName _neg -NotePropertyValue $rs.Count -Force
+        $o | Add-Member -NotePropertyName _posr -NotePropertyValue $(if($pr.Count){($pr -join '+')}else{'-'}) -Force
+        $o | Add-Member -NotePropertyName _pos -NotePropertyValue $pr.Count -Force; $o })
+      $surv=@($sc | Where-Object { $_.消 -ne 1 -and $_._neg -lt $NegThreshold -and $null -ne $_.総合 } | Sort-Object { $_.総合 } -Descending | Select-Object -First 5)
+      $posp=@($surv | Where-Object { $_._pos -ge 1 }); $pool= if($posp.Count -ge 2){ $posp }else{ $surv }
+      $poolNo=@($pool | ForEach-Object { $_.馬番 })
+      $withc=@($pool | Where-Object { "$($_.コンピ)" -ne '' }); $axV3=$null
+      if($withc.Count -ge 2){ $byc=@($withc | Sort-Object { [int]$_.コンピ }); $axV3=$byc[[int][math]::Floor(($byc.Count-1)/2)].馬番 }
+      foreach($o in $sc){ $inp= if($poolNo -contains $o.馬番){1}else{0}; $iax= if($null -ne $axV3 -and $o.馬番 -eq $axV3){1}else{0}
+        $cmp= if("$($o.コンピ)" -ne ''){$o.コンピ}else{'99'}; $sg= if($null -ne $o.総合){$o.総合}else{'-9'}
+        $rr= if($o._negr -eq ''){'-'}else{$o._negr}
+        $h2= if("$($o.h2h)" -ne ''){$o.h2h}else{'-'}; $v3v= if("$($o.V3)" -ne ''){$o.V3}else{'-'}
+        $mk= if("$($o.印)" -ne ''){$o.印}else{'-'}; $ya= if("$($o.矢)" -ne ''){$o.矢}else{'-'}; $pp= if("$($o.人気)" -ne ''){$o.人気}else{'-'}
+        Write-Output ("DUMP|{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}|{12}|{13}" -f $rno,$o.馬番,$cmp,$sg,$inp,$iax,$rr,$o._posr,$h2,$v3v,$mk,$ya,$pp,$o.乗) }
+      continue
+    }
+    if($FunnelSelect){
+      # ファネル: ①ネガ除外 ②総合上位に絞る ③ポジティブ要素ありに絞る → 最終プールから軸をコンピ順位で3通り(上位/下位/中位)、残りを相手に流す
+      $sc=@($ranked | ForEach-Object { $o=$_; $neg=0; $pos=0
+        if($o.消 -eq 1){$neg++}; if($o.危 -eq '危'){$neg++}; if($o.人危 -ne ''){$neg++}
+        if($o.遷 -like '*失速*'){$neg++}; if($o.遷 -like '*ダ替*'){$neg++}; if($o.連 -eq '連後'){$neg++}
+        if($o.路 -like '*延*'){$neg++}; if($o.路 -like '*遠*'){$neg++}; if($o.遠 -eq '遠危'){$neg++}
+        if($o.休 -eq '休消'){$neg++}; if($o.降 -ne ''){$neg++}; if($o.調 -ne ''){$neg++}; if($o.話 -ne ''){$neg++}
+        if($o.遷 -like '*連好*' -or $o.遷 -like '*降2*'){$pos++}
+        if($o.連 -eq '連脚' -or $o.連 -eq '連上'){$pos++}
+        if($o.末 -eq '★'){$pos++}; if($o.安 -like '*★*'){$pos++}; if($o.信 -eq '信'){$pos++}
+        if($o.矢 -eq '↗'){$pos++}; if($o.似 -ne '' -and [int]$o.似 -ge 35){$pos++}
+        $o | Add-Member -NotePropertyName _neg -NotePropertyValue $neg -Force
+        $o | Add-Member -NotePropertyName _pos -NotePropertyValue $pos -Force; $o })
+      $surv=@($sc | Where-Object { $_.消 -ne 1 -and $_._neg -lt $NegThreshold -and $null -ne $_.総合 } | Sort-Object { $_.総合 } -Descending)
+      $surv=@($surv | Select-Object -First 5)                         # ②総合上位5
+      $posp=@($surv | Where-Object { $_._pos -ge 1 })                 # ③ポジティブ要素あり
+      $pool= if($posp.Count -ge 2){ $posp }else{ $surv }              # ポジ該当<2なら緩和(②の上位5)
+      $withc=@($pool | Where-Object { "$($_.コンピ)" -ne '' })
+      if($withc.Count -lt 2){ continue }
+      $byc=@($withc | Sort-Object { [int]$_.コンピ })                 # コンピ順位昇順(1=上位)
+      $axT=$byc[0]; $axB=$byc[-1]; $axM=$byc[[int][math]::Floor(($byc.Count-1)/2)]
+      $pn={ param($ax) (@($pool | Where-Object { "$($_.馬番)" -ne "$($ax.馬番)" }) | ForEach-Object { $_.馬番 }) -join '|' }
+      if($ExportBets){
+        Write-Output ("FUNNEL|{0}|{1}|V1上位|{2}|{3}" -f $rno,$dist,$axT.馬番,(& $pn $axT))
+        Write-Output ("FUNNEL|{0}|{1}|V2下位|{2}|{3}" -f $rno,$dist,$axB.馬番,(& $pn $axB))
+        Write-Output ("FUNNEL|{0}|{1}|V3中位|{2}|{3}" -f $rno,$dist,$axM.馬番,(& $pn $axM))
+        continue
+      }
+      Write-Host ("--- {0}R ({1}m) プール{2}頭(ポジ{3}) ---" -f $rno,$dist,$pool.Count,$posp.Count)
+      Write-Host ("  プール: " + (($byc|ForEach-Object{"{0}{1}(コ{2}/総{3})" -f $_.馬番,$_.馬名,$_.コンピ,$_.総合}) -join '  '))
+      Write-Host ("  V1上位軸:{0}{1}  V2下位軸:{2}{3}  V3中位軸:{4}{5}" -f $axT.馬番,$axT.馬名,$axB.馬番,$axB.馬名,$axM.馬番,$axM.馬名)
+      continue
+    }
+    if($NegSelect){
+      # 選び方: 各馬のネガティブ要素を数える→閾値以上を消し→残りを総合上位順に5頭→軸(1位)+相手4で流す
+      $scored=@($ranked | ForEach-Object { $o=$_; $neg=0; $rs=@()
+        if($o.消 -eq 1){$neg++;$rs+='消'}
+        if($o.危 -eq '危'){$neg++;$rs+='危'}
+        if($o.人危 -ne ''){$neg++;$rs+='人危'}
+        if($o.遷 -like '*失速*'){$neg++;$rs+='失速'}
+        if($o.遷 -like '*ダ替*'){$neg++;$rs+='ダ替'}
+        if($o.連 -eq '連後'){$neg++;$rs+='連後'}
+        if($o.路 -like '*延*'){$neg++;$rs+='延'}
+        if($o.路 -like '*遠*'){$neg++;$rs+='遠'}
+        if($o.遠 -eq '遠危'){$neg++;$rs+='遠危'}
+        if($o.休 -eq '休消'){$neg++;$rs+='休消'}
+        if($o.降 -ne ''){$neg++;$rs+='降'}
+        if($o.調 -ne ''){$neg++;$rs+='調'}
+        if($o.話 -ne ''){$neg++;$rs+='悪'}
+        $o | Add-Member -NotePropertyName _neg -NotePropertyValue $neg -Force
+        $o | Add-Member -NotePropertyName _negr -NotePropertyValue ($rs -join '') -Force
+        $o })
+      $keshi=@($scored | Where-Object { $_.消 -eq 1 -or $_._neg -ge $NegThreshold })
+      $surv =@($scored | Where-Object { $_.消 -ne 1 -and $_._neg -lt $NegThreshold -and $null -ne $_.総合 } | Sort-Object { $_.総合 } -Descending)
+      $five =@($surv | Select-Object -First 5); $axis=$five | Select-Object -First 1; $aite=@($five | Select-Object -Skip 1)
+      if($ExportBets){
+        if($axis){ Write-Output ("EXPORT|{0}|{1}|{2}|消ネガ流し|{3}" -f $rno,$dist,$axis.馬番,(($aite|ForEach-Object{$_.馬番}) -join ',')) }
+        continue
+      }
+      Write-Host ("--- {0}R ({1}m {2}) 消し{3}頭/残{4}頭 ---" -f $rno,$dist,$jouken,$keshi.Count,$surv.Count)
+      if($keshi.Count){ Write-Host ("  消: " + (($keshi|Sort-Object { -$_._neg }|ForEach-Object{"{0}{1}[{2}:{3}]" -f $_.馬番,$_.馬名,$_._neg,$_._negr}) -join '  ')) }
+      $axTxt= if($axis){"{0} {1}(ネガ{2})" -f $axis.馬番,$axis.馬名,$axis._neg}else{'—'}
+      Write-Host ("  ◎軸: {0}" -f $axTxt)
+      Write-Host ("  ○相手: " + (($aite|ForEach-Object{"{0}{1}(ネガ{2})" -f $_.馬番,$_.馬名,$_._neg}) -join '  '))
+      continue
+    }
+    if($ExportBets){
+      # 軸=◎/注、相手=総合上位N(軸と消を除く)。機械可読: EXPORT|R|距離|軸馬番|軸評価|相手馬番カンマ
+      $axis = $ranked | Where-Object { $_.評価 -like '◎*' -or $_.評価 -like '注*' } | Select-Object -First 1
+      if($axis){
+        $partners=@($ranked | Where-Object { $_.評価 -ne '消' -and $_.遠 -ne '遠危' -and $_.休 -ne '休消' -and "$($_.馬番)" -ne "$($axis.馬番)" -and $null -ne $_.総合 } | Select-Object -First $ExportN | ForEach-Object { $_.馬番 })
+        Write-Output ("EXPORT|{0}|{1}|{2}|{3}|{4}" -f $rno,$dist,$axis.馬番,$axis.評価,($partners -join ','))
+      }
+      continue
+    }
+    # 軸確度ラダー(コンピ突出度)[[jra-chihou-signal-verify]]・台帳B-3。指数順位→指数値を復元しg12/range16/idx1/テク6で確度+波乱度。
+    $rkval=@{}; foreach($kk in $cp.Keys){ if($kk -like "$rno|*" -and $cpv.ContainsKey($kk)){ $rkval[[int]$cp[$kk]]=[int]$cpv[$kk] } }
+    $confLbl=''
+    if($rkval.ContainsKey(1) -and $rkval.ContainsKey(2)){
+      $i1=$rkval[1]; $g12=$i1-$rkval[2]
+      $r16= if($rkval.ContainsKey(6)){$i1-$rkval[6]}else{$null}
+      $t6= if($rkval.ContainsKey(3)){$i1+$rkval[2]+$rkval[3]}else{$null}
+      $conf= if($g12 -ge 10 -or ($null -ne $r16 -and $r16 -ge 33) -or $i1 -ge 88){'鉄板'}elseif($g12 -le 4 -and $i1 -lt 76){'警戒'}else{'標準'}
+      $vol= if($null -ne $t6){ if($t6 -lt 200){'荒'}elseif($t6 -ge 220){'堅'}else{'中'} }else{'?'}
+      $confLbl=" [軸確度:{0} g12={1}{2} 指{3} 波乱:{4}]" -f $conf,$g12,$(if($null -ne $r16){" r16=$r16"}else{''}),$i1,$vol
+    }
+    # ベイズ較正複勝確率(モデルA)を軸に併記。較正済(ECE0.46%)で軸の堅さを%表示[[jra-bayes-fukusho-calibration]]
+    if($script:BayesA){
+      $ax0 = $ranked | Where-Object { $_.評価 -like '◎*' -or $_.評価 -like '注*' } | Select-Object -First 1
+      if($ax0){ $au=[int]$ax0.馬番; $akey="$rno|$au"
+        if($cp.ContainsKey($akey) -and $cpv.ContainsKey($akey)){
+          $rk=[int]$cp[$akey]; $rb= if($rk -eq 1){1}elseif($rk -le 3){2}elseif($rk -le 6){3}else{4}
+          $idxZ=([double]$cpv[$akey]-$script:BayesA.idxM)/$script:BayesA.idxS
+          $h2hHas=0.0; $h2hRankZ=0.0
+          if($h2hMap.ContainsKey($au)){
+            $sorted=@($h2hMap.GetEnumerator()|Sort-Object Value -Descending); $hr=0
+            for($ii=0;$ii -lt $sorted.Count;$ii++){ if([int]$sorted[$ii].Key -eq $au){ $hr=$ii+1; break } }
+            if($hr -gt 0){ $h2hHas=1.0; $h2hRankZ=($hr-$script:BayesA.hrM)/$script:BayesA.hrS }
+          }
+          $bw=$script:BayesA.weights
+          $bz=$bw[0]+$bw[1]*[double]($rb -eq 2)+$bw[2]*[double]($rb -eq 3)+$bw[3]*[double]($rb -eq 4)+$bw[4]*$idxZ+$bw[5]*$h2hHas+$bw[6]*$h2hRankZ
+          $bp= if($bz -ge 0){1.0/(1.0+[math]::Exp(-$bz))}else{ $ee=[math]::Exp($bz); $ee/(1.0+$ee) }
+          $bconf= if($bp -ge 0.70){'鉄板'}elseif($bp -ge 0.55){'標準'}else{'警戒'}
+          $confLbl += (" [複勝確率:{0:P0}({1})]" -f $bp,$bconf)
+        }
+      }
+    }
+    if($Notify){
+      $axis = $ranked | Where-Object { $_.評価 -like '◎*' -or $_.評価 -like '注*' } | Select-Object -First 1
+      $aite = @($ranked | Where-Object { $_.評価 -like '○*' } | Select-Object -First 3)
+      # ○相手が危険軸降格等で皆無の時は総合上位(消除く・軸除く)を相手表示=買目ExportBetsと整合(2026-06-28 函館2Rで相手—誤表示→修正)
+      if($aite.Count -eq 0 -and $axis){ $aite = @($ranked | Where-Object { $_.馬番 -ne $axis.馬番 -and $_.消 -ne 1 -and $null -ne $_.総合 } | Select-Object -First 3) }
+      $axTxt = if($axis){ "{0} {1}{2}" -f $axis.評価,$axis.馬番,$axis.馬名 }else{ '—' }
+      $aiTxt = if($aite.Count){ ($aite | ForEach-Object { "{0}{1}" -f $_.馬番,$_.馬名 }) -join ' ' }else{ '—' }
+      $postTxt= if($post){ $post.ToString('HH:mm')+'発走 ' }else{'' }
+      Write-Output ("{0,2}R({1}{2}m) 軸:{3}  相手:{4}{5}" -f $rno,$postTxt,$dist,$axTxt,$aiTxt,$confLbl)
+      continue
+    }
+    Write-Host ("--- {0}R ({1}m {2}) ---{3}" -f $rno,$dist,$jouken,$confLbl)
+    $cols= if($W_front -gt 0){ @('評価','馬番','馬名','総合','h2h','V3','印','矢','コンピ','指','人気','末','先','危','格','降','安','信','調','話','人危','遠','休','遷','連','路','似') }
+      elseif($isSashi){ @('評価','馬番','馬名','総合','h2h','V3','印','矢','コンピ','指','人気','末','前','危','格','降','安','信','調','話','人危','遠','休','遷','連','路','似') }
+      else{ @('評価','馬番','馬名','総合','h2h','V3','印','矢','コンピ','指','人気','末','危','格','降','安','信','調','話','人危','遠','休','遷','連','路','似') }
+    $ranked | Format-Table $cols -AutoSize | Out-String -Width 220 | Write-Host
+  }
+}
+catch { Write-Host ("ERR line {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message) }
+finally { $conn.Close() }

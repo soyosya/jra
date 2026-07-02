@@ -105,3 +105,42 @@ dotnet build "中央競馬.sln"
 - `___` クラス内だけで使われるプロパティやフィールド
 
 `___` 付きコードは現行処理では使わない前提です。再利用する場合は、名前を戻す前にDBモデル登録、呼び出し元、ビルド、実行時の取得先ページ構造を確認してください。
+
+## スケジュールタスク（Windows タスクスケジューラ）
+
+このマシンで自動実行している競馬関連タスクのうち、**JRA中央競馬分**の一覧。すべて **pwsh7**（`C:\Program Files\PowerShell\7\pwsh.exe`）で実行。スクリプト実体は `…\ドキュメント\JRA\tools\`。
+最終更新: 2026-06-21
+
+> **ログオン種別**
+> - **Interactive（ログオン時のみ）**: 実行時にWindowsへログオンしている必要あり。ブラウザ操作（Selenium）・対話処理を伴うものは必須。
+> - **S4U（ログオン不要）**: バックグラウンドで動くが、対話デスクトップ・一部ネットワーク資格情報にアクセス不可。
+
+### JRA中央競馬タスク
+
+| タスク名 | トリガ | ログオン | スクリプト / コマンド | 役割 |
+|---|---|---|---|---|
+| **JRA_KeibabookPickup** | 週次 07:00（JRA開催日） | Interactive | `tools\jra-pickup-scheduled.ps1` | 競馬ブック推奨ピックアップ取込（自己ベスト調教・厩舎の話◎・矢印上向き） |
+| **JRA_KeibabookNoryoku** | 週次 08:00（JRA開催日） | Interactive | `tools\jra-noryoku-scheduled.ps1` | 競馬ブック能力ファクター取込（スピード指数・レイティング・ファクター・ブック指数） |
+| **JRA_WeightLoop** | 毎日 08:45 | Interactive | `tools\jra-weight-loop-task.ps1` | 当日馬体重のライブ取得ループ（発走前馬体重→買目再作成→ログ/メール） |
+| **JRA_ReconcileMail** | 毎日 19:00 | Interactive | `tools\jra-nightly-reconcile.ps1` | 夜間の収支照合メール |
+| **JRA_PicksMail** | 週次 20:00（JRA開催日） | **S4U** | `tools\jra-picks-scheduled.ps1` | JRA予想（軸/相手）メール通知 |
+
+> ※ 週次タスク（Pickup/Noryoku/PicksMail）はJRA開催のある土日が対象。WeightLoop/ReconcileMailは毎日トリガだが、JRA非開催日はスクリプト側で対象なし→無処理。
+
+### 管理コマンド（PowerShell）
+
+```powershell
+# JRAタスク一覧（次回実行時刻・前回結果つき）
+Get-ScheduledTask -TaskName 'JRA_*' | Get-ScheduledTaskInfo |
+  Format-Table TaskName,NextRunTime,LastRunTime,LastTaskResult
+
+# 個別の一時停止 / 再開 / 手動実行
+Disable-ScheduledTask -TaskName <名前>
+Enable-ScheduledTask  -TaskName <名前>
+Start-ScheduledTask   -TaskName <名前>
+```
+
+### 備考
+- **地方競馬分のタスク**（`Keiba_*`：コンピ/調教取込・妙味カード・自動投票ランチャー・結果通知 等）は別リポジトリ `…\ドキュメント\地方競馬\20260607\README.md` の「スケジュールタスク」に記載。同一マシンで併走。
+- `JRA_PicksMail` のみ **S4U**（ログオン不要）、他のJRAタスクは **Interactive**（ログオン時のみ）。
+- メール通知系は Graph API 送信（`secrets.local.json` の Mail*/Graph* 設定）。`JRA_WeightLoop` は当日馬体重をライブ取得して買目を更新する常駐ループ（JRA公式出馬表・SJIS）。

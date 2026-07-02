@@ -1,0 +1,63 @@
+{
+  "IpatVote": {
+    "_comment": "JRA IPAT(即PAT)自動投票。認証は環境変数 IPAT_INETID/IPAT_SUBSCRIBER/IPAT_PIN/IPAT_PARS か secrets.local.json。★Selectors/Deposit の TODO_ は実機ログイン後に較正して埋める。それまで投票/入金/残高は安全に中断。",
+
+    "Mode": "DryRun",
+    "_Mode_options": "DryRun=遷移と買い目をログのみ(無投票・既定) / ConfirmStop=確認画面で停止し人が最終操作 / Auto=投票確定まで自動(実課金・較正後のみ実動)",
+
+    "BetType": "三連複",
+    "Method": "流し",
+    "PartnerCount": 4,
+    "StakePerPointYen": 100,
+    "DailyBudgetYen": 20000,
+    "MaxRaces": 0,
+    "Venues": [],
+
+    "Headless": false,
+    "ManualLoginAssistSeconds": 120,
+    "ConfirmWaitSeconds": 180,
+    "CompletedText": "投票を受け付けました|受付番号|投票完了",
+    "ClosedText": "発売を締め切|締め切られて",
+
+    "Urls": { "Top": "https://www.ipat.jra.go.jp/" },
+
+    "Selectors": {
+      "_comment": "★IPAT実DOMに合わせて較正。CSSセレクタ。ログイン2画面は較正済(2026-06-21・実HTML)。LoggedInMarker以降(メニュー/投票/残高/入金)はTODO_=未較正で実行されない(安全)。",
+      "_login_note": "①INET-ID画面(ipat.jra.go.jp/): inetid入力→a[title=ログイン] ②加入者情報(pw_080_i.cgi): i=加入者番号/p=暗証番号/r=P-ARS→a[title=ネット投票メニューへ]。初回/定期で約定同意画面(contract_area)が挟まる場合あり=ManualLoginAssistSecondsで人が同意。",
+      "_bet_note": "通常投票(AngularJS #!/bet/basic)較正済2026-06-21・全式別+全方式+カートの実HTML受領。場/式別/方式の<select>はoption値がAngularハッシュ(object:2590等=セッション毎に変動)で不安定→可視テキストで選択(SelectByText)。レースは値=raceIndex(R-1)で安定→SelectByValue。三連複ながし=軸horse1_no/相手horse2_no(軸1頭=radio・軸2頭=checkbox×2、axis列を|区切りで複数指定)。三連単着ながし=固定着horse{着}_no(radio)+相手horse{欠落着の最小}_no(checkbox)で全6方式対応(1着/2着/3着/1・2着/1・3着/2・3着、マルチ=input[ng-model=vm.bMulti])。BOX=no{馬番}、フォーメーションは1着horse1_no/2着horse2_no/3着horse3_no。金額は100円単位(suffix 00円)=stake/100。カートはセット後『入力終了』→購入予定リスト→合計金額入力に画面表示の合計(getCalcTotalAmount=ReadCartTotal)と同額→『購入する』。複数馬券は各行金額後にカートで一括確認。",
+      "LoginInetIdInput": "input[name=\"inetid\"]",
+      "LoginInetIdSubmit": "a[title=\"ログイン\"]",
+      "LoginSubscriberInput": "input[name=\"i\"]",
+      "LoginPinInput": "input[name=\"p\"]",
+      "LoginParsInput": "input[name=\"r\"]",
+      "LoginSubmit": "a[title=\"ネット投票メニューへ\"]",
+      "LoggedInMarker": "[ui-sref=\"bet.basic\"]",
+      "BalanceText": ".ipat-menu-table-purchase td.text-lg.text-right",
+      "MenuNormalVote": "[ui-sref=\"bet.basic\"]",
+      "SelRacecourse": "select#select-course-race-course",
+      "SelRaceNumber": "select#select-course-race-race",
+      "SelBetType": "select#bet-basic-type",
+      "SelMethod": "select#bet-basic-method",
+      "AxisInputTemplate": "input#no{UMA}",
+      "PartnerInputTemplate": "input#no{UMA}",
+      "AmountInput": ".selection-amount input[ng-model=\"vm.nUnit\"]",
+      "SetButton": ".selection-buttons button[ng-click=\"vm.onSet()\"]",
+      "PurchaseButton": ".selection-buttons button[ng-click=\"vm.onShowBetList()\"]",
+      "ConfirmAmountInput": "input[ng-model=\"vm.cAmountTotal\"]",
+      "VoteSubmit": "button[ng-click=\"vm.clickPurchase()\"]",
+      "VoteConfirmOk": ".ipat-error-window button.btn-ok"
+    },
+
+    "Deposit": {
+      "_comment": "即PAT入金(SP入出金サイト un.sp.jra.go.jp/jraaccount2036)。較正済2026-06-21。投票メニューの入金ボタン→別窓→①金額NYUKIN→次へ→②暗証PASS_WORD→【実行】とJS確認ポップアップOKは人が押す(Autoなし・直前で停止)。MaxDepositYenは誤計算時の安全弁。",
+      "MenuDeposit": "button[ng-click=\"vm.clickNyukin()\"]",
+      "AmountInput": "input[name=\"NYUKIN\"]",
+      "NextButton": "a.btn-green",
+      "PinInput": "input[name=\"PASS_WORD\"]",
+      "SubmitButton": "a.btn-green",
+      "CompletedText": "入金指示完了|受付ID",
+      "BufferYen": 0,
+      "MaxDepositYen": 50000
+    }
+  }
+}

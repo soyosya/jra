@@ -1,0 +1,1 @@
+SELECT TOP 3 開催日, COUNT(DISTINCT レース番号) R FROM レース情報 WHERE 開催場所=N'東京' AND YEAR(開催日)=2025 AND 着順>0 GROUP BY 開催日 ORDER BY 開催日 DESC;
