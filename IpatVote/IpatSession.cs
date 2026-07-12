@@ -130,6 +130,23 @@ public sealed class IpatSession : IDisposable
         catch { return -1; }
     }
 
+    /// <summary>投票後など別画面にいる時、会員トップ(メニュー)へ戻ってから残高を読む。
+    /// 既ログイン状態ならナビゲートのみでメニューが出る想定。出なければ Login() で再確認(既ログインならマーカー確認で即成立)。読めなければ -1。</summary>
+    public int ReadBalanceViaMenu(string balCss)
+    {
+        if (Driver == null || IsTodo(balCss)) return -1;
+        try
+        {
+            Driver.Navigate().GoToUrl(_opt.Urls.Top);
+            bool onMenu = !IsTodo(_opt.Selectors.LoggedInMarker)
+                          && WaitForExists(_opt.Selectors.LoggedInMarker, TimeSpan.FromSeconds(8));
+            if (!onMenu && !Login()) return -1;               // メニューに戻れなければ再ログインで確実にメニューへ
+            WaitForExists(balCss, TimeSpan.FromSeconds(6));    // 残高テーブルの描画待ち
+            return ReadBalance(balCss);
+        }
+        catch { return -1; }
+    }
+
     /// <summary>ネイティブJS確認ダイアログ(「入金します。よろしいですか？」等)が出たらOK(Accept)。Autoのみ使用。
     /// UnhandledPromptBehavior=Ignoreでも明示Accept()は可能。出なければfalse。</summary>
     public bool AcceptAlert(TimeSpan timeout)
@@ -152,6 +169,49 @@ public sealed class IpatSession : IDisposable
         while (DateTime.Now < end)
         {
             try { if (rx.IsMatch(Driver.PageSource)) return true; } catch { }
+            Thread.Sleep(1000);
+        }
+        return false;
+    }
+
+    /// <summary>ページ内の全「受付番号」の数字を集合で収集。IPATはSPAで前回投票の受付番号がDOMに残るため、単純な文字列一致では誤完了する。集合差分で"新規発番"を判定する。</summary>
+    public HashSet<string> ReadReceiptNos()
+    {
+        var set = new HashSet<string>();
+        if (Driver == null) return set;
+        try { foreach (Match m in Regex.Matches(Driver.PageSource, @"受付番号[\s\S]{0,24}?(\d{2,})")) if (m.Groups[1].Success) set.Add(m.Groups[1].Value); }
+        catch { }
+        return set;
+    }
+
+    /// <summary>送信前の受付番号集合(before)に含まれない"新しい受付番号"が出現するまで待つ。出現=実際に発番された=成立。出現しなければ(前回の残存テキストのみ)=未成立でfalse。★誤完了(phantom 投票完了)防止の要。</summary>
+    public bool WaitForNewReceipt(HashSet<string> before, int timeoutSec)
+    {
+        if (Driver == null) return false;
+        var end = DateTime.Now.AddSeconds(timeoutSec);
+        while (DateTime.Now < end)
+        {
+            try { foreach (var r in ReadReceiptNos()) if (!before.Contains(r)) return true; } catch { }
+            Thread.Sleep(1000);
+        }
+        return false;
+    }
+
+    /// <summary>投票成立判定(2026-07-05改)。IPAT完了画面の「受け付けました」メッセージが"新規に"出現(送信前は無い→単票は即成立)を主判定にする。受付メッセージが送信前から残存している(=複数買い目カートの前票分)場合のみ、新しい受付番号の発番で二重確認。受付番号regexは実画面で読めない例があり(false-negative)、メッセージ主体に変更。</summary>
+    public bool WaitForFreshAcceptance(string acceptRegex, bool beforeAccept, HashSet<string> beforeReceipts, int timeoutSec)
+    {
+        if (Driver == null) return false;
+        var rx = new Regex(acceptRegex);
+        var end = DateTime.Now.AddSeconds(timeoutSec);
+        while (DateTime.Now < end)
+        {
+            try
+            {
+                bool nowAccept = rx.IsMatch(Driver.PageSource);
+                if (nowAccept && !beforeAccept) return true;                         // 受付メッセージが新規出現=成立(単票の正常系)
+                foreach (var r in ReadReceiptNos()) if (!beforeReceipts.Contains(r)) return true; // 残存時は新受付番号で確認(補助)
+            }
+            catch { }
             Thread.Sleep(1000);
         }
         return false;
@@ -283,20 +343,27 @@ public sealed class IpatSession : IDisposable
         catch { return false; }
     }
     /// <summary>レース番号ボタンをクリック(テキスト先頭の「N R」を厳密一致。11Rと1Rを誤認しない)。</summary>
-    public bool TryClickRaceButton(string css, int raceNo)
+    /// <summary>レース番号ボタン(ボタン形式)を選択。★締切ガード: 対象レースのボタンが「締切」表示 or 無効(disabled)ならクリックせず Closed を返す(=投票中止)。対象ボタンが見つからない(=投票リンクなし)場合は NotFound(ユーザ規約=リンクなし=締切扱いで中止)。有効ならクリックして Clicked。</summary>
+    public RaceSelect ClickRaceButton(string css, int raceNo)
     {
-        if (IsTodo(css) || Driver == null) return false;
+        if (IsTodo(css) || Driver == null) return RaceSelect.NotFound;
         try
         {
             foreach (var e in Driver.FindElements(By.CssSelector(css)))
             {
                 if (!e.Displayed) continue;
-                var m = Regex.Match(e.Text ?? "", @"(\d+)\s*R");   // 「2R (10:39)」等の先頭数字
-                if (m.Success && int.Parse(m.Groups[1].Value) == raceNo) { e.Click(); return true; }
+                var txt = e.Text ?? "";
+                var m = Regex.Match(txt, @"(\d+)\s*R");   // 「2R (10:39)」「3R 締切」等の先頭数字
+                if (!m.Success || int.Parse(m.Groups[1].Value) != raceNo) continue;
+                // 対象レースのボタン発見。締切(テキストに「締切」含む)または無効化(disabled)ならクリックしない=投票中止。
+                bool closed = txt.Contains("締切") || !e.Enabled;
+                try { if (!closed) { var da = e.GetAttribute("disabled"); var ac = e.GetAttribute("aria-disabled"); if (!string.IsNullOrEmpty(da) || string.Equals(ac, "true", StringComparison.OrdinalIgnoreCase)) closed = true; } } catch { }
+                if (closed) return RaceSelect.Closed;
+                e.Click(); return RaceSelect.Clicked;
             }
         }
         catch { }
-        return false;
+        return RaceSelect.NotFound;
     }
     public bool PageContains(string regex) { try { return Driver != null && new Regex(regex).IsMatch(Driver.PageSource); } catch { return false; } }
 

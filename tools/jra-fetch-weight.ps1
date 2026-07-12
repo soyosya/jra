@@ -35,7 +35,8 @@ function Cn([string]$servlet,[string]$c){
 #   ★馬体重はパドック発表後のみだが騎手/斤量は出馬表で常時取れる→馬番が取れた行は馬体重無しでも返す。
 function Parse-Weights([string]$html){
   $rows=@()
-  $hm=[regex]::Matches($html,'(\d{1,2})\s*レース')   # "Nレース" 見出しでブロック分割
+  # ★レース見出しは race_num_N.png 画像で分割(2026-07-05修正)。旧 '(\d{1,2})レース' はWIN5リンクの alt="ウインファイブ Nレース目" に誤爆し、重賞/特別(WIN5対象)のR10-12で馬が別Rに誤割当→重複排除で体重が捨てられていた(小倉10R等)。
+  $hm=[regex]::Matches($html,'race_num_(\d{1,2})\.png')   # 真の見出し(/JRADB/img/race_number_main/race_num_N.png)のみ。WIN5の race-title_win5_N.png は不一致
   if($hm.Count -eq 0){ return ,@() }
   for($i=0;$i -lt $hm.Count;$i++){
     $rno=[int]$hm[$i].Groups[1].Value

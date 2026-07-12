@@ -2,6 +2,7 @@ namespace 中央競馬.IpatVote;
 
 public enum BetMode { DryRun, ConfirmStop, Auto }
 public enum BetResult { Planned, Purchased, StoppedForConfirm, Closed, Failed }
+public enum RaceSelect { Clicked, Closed, NotFound }   // レース番号ボタン選択の結果(Closed=締切表示/NotFound=リンクなし→いずれも投票中止)
 public enum DepositResult { Skipped, Planned, StoppedForConfirm, Done, Failed }
 
 /// <summary>ipat.json の IpatVote セクション。RakutenOptions相当。</summary>
@@ -20,7 +21,8 @@ public sealed class IpatOptions
     public int ManualLoginAssistSeconds { get; set; } = 120;
     public int ConfirmWaitSeconds { get; set; } = 180;
     public string CompletedText { get; set; } = "投票を受け付けました|受付番号|投票完了";
-    public string ClosedText { get; set; } = "発売を締め切|締め切られて";
+    public string AcceptedText { get; set; } = "受け付けました";   // 投票成立の主判定=完了画面の受付メッセージ(「(お客様の投票を)受け付けました」)。受付番号regexより堅牢([[jra-ipat-vote]] 2026-07-05)
+    public string ClosedText { get; set; } = "発売を締め切|締め切られて|投票可能な投票内容が(?:無|な)い";  // ★カート(購入予定リスト)段階の締切=「※投票可能な投票内容が無いため、投票できません。」も含む(選択後に締切ったケース)。固有文言に限定し誤中止を回避
     public IpatUrls Urls { get; set; } = new();
     public IpatSelectors Selectors { get; set; } = new();
     public IpatDeposit Deposit { get; set; } = new();

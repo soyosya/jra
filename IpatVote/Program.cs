@@ -193,10 +193,14 @@ foreach (var b in bets)
     var result = page.PlaceBet(b, out int spent); races++;
     if (opt.ResolvedMode == BetMode.ConfirmStop && result == BetResult.StoppedForConfirm)
     {
+        bool beforeAccept = sess.PageContains(opt.AcceptedText);   // 人の購入操作前に受付メッセージが残存しているか
+        var beforeReceipts = sess.ReadReceiptNos();                // 残存時の二重確認用
         Console.WriteLine($"  {b.Venue}{b.Race}R 確認停止。ブラウザのカートで内容(場/R/式別/方式/組数/金額)を確認し、合計金額入力→『購入する』→OK をご自身で操作してください。");
         Console.WriteLine("  → 確認/購入が済んだら、このウィンドウで Enter を押すと次へ進みます(押すまでブラウザは開いたまま=自動では閉じません)。");
         try { Console.ReadLine(); } catch { }   // 固定タイムアウトで閉じず、人の操作完了(Enter)まで待つ
-        if (sess.PageContains(opt.CompletedText)) result = BetResult.Purchased;
+        // ★成立判定=「受け付けました」完了メッセージの新規出現(主)+新受付番号(補助)。未購入でEnterした場合は未成立=失敗として記録。
+        if (sess.WaitForFreshAcceptance(opt.AcceptedText, beforeAccept, beforeReceipts, 5)) result = BetResult.Purchased;
+        else Console.WriteLine("  ⚠完了メッセージ/新受付番号を検出できず=未成立(失敗)として記録します(未購入の可能性)。");
     }
     string label = result switch { BetResult.Purchased => "投票完了", BetResult.Planned => "計画", BetResult.StoppedForConfirm => "見送り", BetResult.Closed => "締切", _ => "失敗" };
     if (result is BetResult.Purchased or BetResult.Planned) { spentTotal += spent; placed++; }
@@ -208,5 +212,26 @@ Console.WriteLine("\n===== 結果 =====");
 summary.ForEach(Console.WriteLine);
 string verb = opt.ResolvedMode switch { BetMode.Auto => "投票(実課金)", BetMode.ConfirmStop => "確認停止まで準備", _ => "計画(無投票)" };
 Console.WriteLine($"{verb}: {placed}レース / 合計 {spentTotal:N0}円");
+
+// ★投票後の残高照会→画面(ipat-balance.txt)を更新。ログイン済みセッションを再利用(追加ログインなし・読み取り専用)。
+// 投票履歴は上のhistory.Saveで保存済み・収支はRunnerControlの自動精算ループが最新化するため、ここでは残高のみ更新する。
+if (opt.ResolvedMode != BetMode.DryRun && placed > 0)
+{
+    try
+    {
+        int balAfter = sess.ReadBalanceViaMenu(opt.Selectors.BalanceText);   // メニューへ戻ってから読む(投票後は投票完了画面にいるため)
+        if (balAfter >= 0)
+        {
+            var balFile = Environment.GetEnvironmentVariable("IPAT_BALANCE_FILE");
+            if (string.IsNullOrWhiteSpace(balFile)) balFile = @"C:\jra\RunnerControl\ipat-balance.txt";
+            System.IO.File.WriteAllText(balFile, System.DateTime.Now.ToString("o") + "\t" + balAfter, new System.Text.UTF8Encoding(false));
+            Console.WriteLine($"投票後残高照会: {balAfter:N0}円 → 画面(残高)を更新しました。");
+            Log.Line($"投票後残高照会 {balAfter}円 → {balFile} 更新");
+        }
+        else { Console.WriteLine("投票後残高照会: 残高を読み取れませんでした(メニュー未遷移/セレクタ)。画面残高は据え置き。"); Log.Line("投票後残高照会: 残高読取-1(メニュー未遷移/セレクタ)。画面残高は据え置き。"); }
+    }
+    catch (System.Exception ex) { Log.Line("投票後残高照会に失敗(画面残高は据え置き): " + ex.Message); }
+}
+
 Log.Line($"=== IpatVote 終了 {verb} {placed}R {spentTotal:N0}円 ===");
 return 0;

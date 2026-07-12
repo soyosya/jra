@@ -373,3 +373,14 @@ secrets.local.json
 
 # appsettings.json は接続情報(DB資格情報)を含むため一律追跡しない。テンプレ=appsettings.example.json
 appsettings.json
+
+# 大容量バックテストダンプ(DB由来・再生成可能)
+analysis/**/*.tsv
+# IPAT残高の実行時キャッシュ(変動・コミット不要)
+RunnerControl/ipat-balance.txt
+RunnerControl/ipat-balance-status.json
+
+# analysis配下の大容量データ(DB由来ダンプ・BT出力・再生成可能)
+analysis/**/*.csv
+analysis/**/*.json
+analysis/**/*.zip

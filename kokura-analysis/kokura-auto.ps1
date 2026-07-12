@@ -84,8 +84,10 @@ if($Notify){
   $note='人気1-2番は危険材料あっても相手に残す。' + $(if($isHiVar){'本レースは新馬/未勝利＝高分散につき3連複相手を広めにケア。'}else{''})
   $nl=[Environment]::NewLine
   $lines=@()
-  $lines += "■ 小倉 ${next}R  ${dist}${surf} ${jouken}"
-  $lines += "軸確度: $tierTxt"
+  $field = $info.Count
+  $mikata = if($tier -match '鉄板'){'本命堅そう'}elseif($tier -match '警戒'){'波乱含み・警戒'}else{'標準'}
+  $bpart = if($fukuPct){"ベイズ${fukuPct}%"}else{"確度$tier"}
+  $lines += "${next}R｜${surf}${dist} ${jouken}（${field}頭）｜${bpart}｜${mikata}"
   $lines += ""
   $lines += "【予想】"
   $lines += "◎軸  $(NN $axisNo)"

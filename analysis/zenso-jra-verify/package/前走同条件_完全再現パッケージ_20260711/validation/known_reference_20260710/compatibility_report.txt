@@ -1,0 +1,10 @@
+前走同条件 名称変更・スキーマ移行 同値性検証
+比較対象: 印4頭、参考買目、S/A候補、統合アクション、購入状態
+合計比較レース数=239
+2023-08-29: races=48, semantic_differences=0
+2025-04-23: races=48, semantic_differences=0
+2025-06-20: races=24, semantic_differences=0
+2025-09-08: races=48, semantic_differences=0
+2025-12-03: races=35, semantic_differences=0
+2026-07-10: races=36, semantic_differences=0
+判定=PASS

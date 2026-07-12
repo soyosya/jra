@@ -179,8 +179,12 @@ public sealed class BettingPage
                 if (!_sess.TryClickContaining(".places button", b.Venue))
                 { Log.Line($"  場名ボタン({b.Venue})が見つかりません({b.Venue}{b.Race}R)。中断。"); return BetResult.Failed; }
                 Thread.Sleep(400); // レース一覧の再描画待ち
-                if (!_sess.TryClickRaceButton(".races button", b.Race))
-                { Log.Line($"  レースボタン({b.Race}R)が見つかりません/締切({b.Venue}{b.Race}R)。中断。"); return BetResult.Failed; }
+                // ★締切ガード(ユーザ規約): 対象レースの投票リンクが無い/締切表示なら投票を中止(Closed)。
+                var rsel = _sess.ClickRaceButton(".races button", b.Race);
+                if (rsel == RaceSelect.Closed)
+                { Log.Line($"  {b.Venue}{b.Race}R は締切(ボタンが締切表示/無効)=投票中止(Closed)。"); return BetResult.Closed; }
+                if (rsel == RaceSelect.NotFound)
+                { Log.Line($"  {b.Venue}{b.Race}R の投票リンクがありません=締切とみなし投票中止(Closed)。"); return BetResult.Closed; }
             }
             Thread.Sleep(400); // 式別/方式テーブルの描画待ち
             // 式別/方式を選択(両レイアウト共通の<select>)
@@ -326,7 +330,9 @@ public sealed class BettingPage
             // 2) 入力終了→購入予定リスト(カート)
             _sess.TryClick(_opt.Selectors.PurchaseButton);
             _sess.WaitForExists(_opt.Selectors.ConfirmAmountInput, TimeSpan.FromSeconds(10));
-            if (_sess.PageContains(_opt.ClosedText)) return BetResult.Closed;
+            // ★締切ガード(カート段階・ユーザ規約): 「※投票可能な投票内容が無いため、投票できません。」等が出たら選択後に締切=投票中止(Closed)。
+            if (_sess.PageContains(_opt.ClosedText))
+            { Log.Line($"  {b.Venue}{b.Race}R は締切(購入予定リストに投票可能な内容なし)=投票中止(Closed)。"); return BetResult.Closed; }
 
             if (_opt.ResolvedMode == BetMode.ConfirmStop)
             {
@@ -343,11 +349,16 @@ public sealed class BettingPage
             for (int i = 0; i < 16 && shownTotal <= 0; i++) { shownTotal = _sess.ReadCartTotal(); if (shownTotal <= 0) Thread.Sleep(250); }
             int confirmAmt = shownTotal > 0 ? shownTotal : spent; // 表示額優先(取消等で計算と差異あり得る)
             _sess.SetText(_opt.Selectors.ConfirmAmountInput, confirmAmt.ToString());
+            bool beforeAccept = _sess.PageContains(_opt.AcceptedText);   // 送信前に受付完了メッセージが残存しているか(通常false=カート/確認画面)
+            var beforeReceipts = _sess.ReadReceiptNos();                 // 送信前の受付番号(残存時の二重確認用)
             _sess.TryClick(_opt.Selectors.VoteSubmit); // 「購入する」
             // 「投票内容と金額を送信してもよろしいですか？」ポップアップのOK=実際の課金発火点
             _sess.WaitForExists(_opt.Selectors.VoteConfirmOk, TimeSpan.FromSeconds(8));
             _sess.TryClick(_opt.Selectors.VoteConfirmOk);
-            return _sess.WaitForVoteCompleted(_opt.CompletedText, 25) ? BetResult.Purchased : BetResult.Failed; // 完了=「投票を受け付けました/受付番号」
+            // ★成立判定=「受け付けました」完了メッセージの新規出現(主)+新受付番号(補助)。受付番号regexが読めず成立を取り逃す誤失敗(2026-07-05実害)を修正。
+            bool got = _sess.WaitForFreshAcceptance(_opt.AcceptedText, beforeAccept, beforeReceipts, 25);
+            if (!got) Log.Line($"  ⚠完了メッセージ/新受付番号を検出できず=未成立(Failed)扱い {b.Venue}{b.Race}R {bt}(実送信されていない可能性・締切/セレクタ要確認)。");
+            return got ? BetResult.Purchased : BetResult.Failed;
         }
         catch (Exception ex) { Log.Line($"  投票でエラー {b.Venue}{b.Race}R: {ex.Message}"); return BetResult.Failed; }
     }

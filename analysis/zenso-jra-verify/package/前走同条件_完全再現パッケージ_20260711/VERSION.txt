@@ -1,0 +1,6 @@
+package_version=2.0.0
+samecond_logic=SAMECOND_CONFIDENCE/3.1-production-simple
+display_name=前走同条件
+reference_buy_logic=REFERENCE_DISPLAY_BUY/1.0
+build_date=2026-07-11
+change_type=name-and-schema-migration; algorithm-unchanged

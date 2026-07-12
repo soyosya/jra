@@ -22,7 +22,7 @@
     "Urls": { "Top": "https://www.ipat.jra.go.jp/" },
 
     "Selectors": {
-      "_comment": "★IPAT実DOMに合わせて較正。CSSセレクタ。ログイン2画面は較正済(2026-06-21・実HTML)。LoggedInMarker以降(メニュー/投票/残高/入金)はTODO_=未較正で実行されない(安全)。",
+      "_comment": "★IPAT実DOMに合わせて較正。CSSセレクタ。ログイン2画面は較正済(2026-06-21・実HTML)。残高(BalanceText=購入限度額)+LoggedInMarker+通常投票は較正済(2026-07照会画面HTMLで確認)。投票/入金の実操作はConfirmStop/人が最終操作で安全。",
       "_login_note": "①INET-ID画面(ipat.jra.go.jp/): inetid入力→a[title=ログイン] ②加入者情報(pw_080_i.cgi): i=加入者番号/p=暗証番号/r=P-ARS→a[title=ネット投票メニューへ]。初回/定期で約定同意画面(contract_area)が挟まる場合あり=ManualLoginAssistSecondsで人が同意。",
       "_bet_note": "通常投票(AngularJS #!/bet/basic)較正済2026-06-21・全式別+全方式+カートの実HTML受領。場/式別/方式の<select>はoption値がAngularハッシュ(object:2590等=セッション毎に変動)で不安定→可視テキストで選択(SelectByText)。レースは値=raceIndex(R-1)で安定→SelectByValue。三連複ながし=軸horse1_no/相手horse2_no(軸1頭=radio・軸2頭=checkbox×2、axis列を|区切りで複数指定)。三連単着ながし=固定着horse{着}_no(radio)+相手horse{欠落着の最小}_no(checkbox)で全6方式対応(1着/2着/3着/1・2着/1・3着/2・3着、マルチ=input[ng-model=vm.bMulti])。BOX=no{馬番}、フォーメーションは1着horse1_no/2着horse2_no/3着horse3_no。金額は100円単位(suffix 00円)=stake/100。カートはセット後『入力終了』→購入予定リスト→合計金額入力に画面表示の合計(getCalcTotalAmount=ReadCartTotal)と同額→『購入する』。複数馬券は各行金額後にカートで一括確認。",
       "LoginInetIdInput": "input[name=\"inetid\"]",

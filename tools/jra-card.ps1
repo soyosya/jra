@@ -13,8 +13,17 @@ param(
   [Parameter(Mandatory)][string]$Venue,
   [double]$W_h2h=0.4, [double]$W_v3=0.35, [double]$W_compi=0.25,
   [switch]$NoCondH2h,    # h2hの同条件限定連鎖を無効化(既定=有効)。既定は今走と同種別×距離±200mの過去走のみで連鎖(検証で軸複勝率+2〜4pt全期間[[keiba-rating-system]])
+  [switch]$NoH2hRel,     # h2h信頼度スケールを無効化(既定=有効)。共通対戦の被覆率でh2h重み可変+コンピ合議ゲート(診断2026-07-03: 厚80%+複回収99.9%/薄<50%74.1%・h2h1位×コンピ4+は複17.4%)
   [double]$W_front=-1,   # 先行力(前残り)因子の重み。-1=自動(前残り場のみ既定値、それ以外0)。検証=函館で軸確度に上乗せ価値([[hakodate-basics]])
   [double]$W_rota=0.15,  # 昨年同開催の好走馬プロファイル合致度の軸ブースト重み([[jra-meeting-rotation]])。0で無効。前走ローテ×同場の昨年同条件複勝率を軸スコアに加点
+  [switch]$NoLoneSpeed,  # 単騎速(展開適性)ブーストを無効化(既定=有効)。フィールドで先行馬[逃/先]が1頭のみ=そのマイペース馬にコンピ上位限定で総合加点。複勝+13pt全年頑健([[jra-pace-fit]])
+  [double]$LoneSpeedBoost=0.4, # 単騎速馬への総合ブースト量(z合成スケール。h2h満額z=1相当)
+  [switch]$NoCondApt,    # 条件適性(差分適性)を無効化(既定=有効)。種別(芝/ダ)+距離両極(短/長)で「過去その条件が自分の平均より上/下の馬」を正負の確度に。複勝±5〜11pt全年頑健([[jra-condition-aptitude]])
+  [double]$CondAptBoost=0.2, # 条件適性+の総合ブースト量(適性-はこの1.25倍を減点)
+  [switch]$NoPrevDom,    # 前走完勝(前走で先行[逃/先]かつ上り3F上位25%=完勝フォーム)ブーストを無効化(既定=有効)。複勝44%(base22%)・連好と58%非重複の独立確度([[jra-form-cell]])
+  [double]$PrevDomBoost=0.25, # 前走完勝馬の総合ブースト量
+  [switch]$NoPrevNeg,    # 消し要素(前走大敗/長期休養明け)を無効化(既定=有効)。前敗=前走で頭数下位30%(複勝-5〜-14pt)/長休=中17週+の休養明け(C1/C2-3で-5〜-6pt)。全年頑健([[jra-negsweep]])
+  [switch]$NoAgariDecay, # 消し要素(末落=中団勢の上り3F順位 大幅悪化)を無効化(既定=有効)。中団×前々走→前走で上り3F percentile+0.25以上悪化=複勝率18.5%全年抑制([[jra-zenso-midpack-nontransfer]])
   [int]$RecentN=5, [int]$RecentDays=183,
   [int]$WeightGainThresh=8, # 馬体重大幅増の軸割引閾値(+kg)。+このkg以上増で◎軸に▽増(過剰人気)。当日体重発表後のみ([[jra-meeting-rotation]])
   [switch]$NoAxisCap, # 軸足切り(コンピ上位3)を無効化。既定=有効: 総合1位のコンピ順位が4位以下ならコンピ上位3内の総合最上位を軸に差替([[keiba-axis-method-comparison]] 2026-06-27検証=中位軸は複勝激減)
@@ -25,6 +34,14 @@ param(
   [switch]$WithResult, # -NotifyFull時、各頭の先頭に確定着順を付加(振り返り用)。競走結果(着順)が必要。
   [switch]$ExportBets, # 買目出力用: 各レースの 軸 + 総合上位N頭(相手) を機械可読行で出力(三連複等を厚く)。表/Notifyより優先。
   [int]$ExportN=5,  # ExportBetsの相手頭数(総合上位N、消除く)。
+  [switch]$ExportHorses, # 全馬ダンプ: HORSE|R|馬番|評価(全ラベル)|コンピ|総合。反省ログ/バックテスト用(消し精度・シグナル軸の成否を結果と突合)。-ExportBetsと併用可。
+  [switch]$KeepNegPartners, # 既定=相手からラベルネガ馬(前敗/危/不調/相悪/長休/種替/不適)を除外(検証: 的中率↑・回収不変[[jra-partner-selection]])。このスイッチで従来どおり相手に残す
+  # ★相手フロア(2026-07-05・2025+2026後追い深掘りの最重要改善): ネガラベルで相手除外する馬でも「コンピ上位 or 総合上位」なら相手に残す。
+  #   根拠=△不調/相悪/前敗/種替/長休/危がコンピ上位・総合上位(実測で総合1.19/1.03/1.02)・勝ち馬を相手から消す取りこぼしが最頻・最大の失点([[jra-negsweep]]監査所見)。既定ON。-NoRelayFloorで従来動作。
+  [switch]$NoRelayFloor,     # 相手フロアを無効化(=従来のネガ全除外)。既定=フロア有効(コ3位内/総合0.6超のネガ馬は相手に残す)。
+  [int]$RelayFloorCompi=3,   # フロア: コンピ順位がこの値以内ならネガでも相手に残す(既定3)。
+  [double]$RelayFloorSougou=0.6, # フロア: 総合スコアがこの値以上ならネガでも相手に残す(既定0.6・2ヶ月窓BTで最終確定推奨)。
+  [switch]$NoRelayWiden,     # 相手拡幅を無効化。既定=有効(相手がExportN未満なら総合上位の残りで補充・薄すぎ回避)。
   [switch]$NegSelect, # 選び方=ネガティブ要素数で消しウマ除外→残り総合上位5頭→軸(総合1位)+相手4で流す。表示。-ExportBets併用でEXPORT行も出力
   [int]$NegThreshold=2, # 消し閾値: ネガティブ要素がこの数以上の馬を消す(既定2)
   [switch]$FunnelSelect, # ファネル選択=①ネガ除外→②総合上位5に絞る→③ポジティブ要素ありに絞る→最終プールから軸をコンピ順位で3通り(上位/下位/中位)。FUNNEL行出力
@@ -79,8 +96,10 @@ function Compute-H2h([string]$v,[string]$d,[int]$rno){
   function PairM($a,$b){ $vv=@(); if($mavg[$a].ContainsKey($b)){$vv+=$mavg[$a][$b]}; if($mavg[$b].ContainsKey($a)){$vv+=(-1.0*$mavg[$b][$a])}; if($vv.Count -gt 0){return (($vv|Measure-Object -Average).Average)}
     $common=@($mavg[$a].Keys|Where-Object{$mavg[$b].ContainsKey($_) -and $_ -ne $a -and $_ -ne $b}); if($common.Count -eq 0){return $null}
     $fc=@($common|Where-Object{$fset.ContainsKey($_)}); $use= if($fc.Count -gt 0){$fc}else{$common}; $est=foreach($c in $use){ $mavg[$a][$c]-$mavg[$b][$c] }; return (Median $est) }
-  $h2h=@{}; foreach($a in $field){ $ms=@(); foreach($b in $field){ if($a -ne $b){ $m=PairM $a $b; if($null -ne $m){$ms+=$m} } }; if($ms.Count -ge 1){ $h2h[$a]=($ms|Measure-Object -Average).Average } }
-  return $h2h
+  # 被覆率cov=各馬がPairM推定を持てた相手数/(頭数-1)。h2h信頼度(共通対戦の厚み)=[[jra-axis-danger]]の h2h確度診断2026-07-03: 厚80%+は複回収99.9%/薄<50%は74.1%。
+  $h2h=@{}; $cov=@{}; $fn=[math]::Max(1,$field.Count-1)
+  foreach($a in $field){ $ms=@(); foreach($b in $field){ if($a -ne $b){ $m=PairM $a $b; if($null -ne $m){$ms+=$m} } }; if($ms.Count -ge 1){ $h2h[$a]=($ms|Measure-Object -Average).Average; $cov[$a]=[double]$ms.Count/$fn } }
+  return @{ score=$h2h; cov=$cov }
 }
 
 # ★末脚signal: 前走・前々走とも 上り3Fレース内ベスト3 かつ 1着との着差≤1.2秒(前2走365日内)。馬名->status
@@ -133,6 +152,9 @@ function Compute-DangerFlag([string]$v,[string]$d,[int]$rno,[int]$todayCls){
   return $flag
 }
 
+# 馬名正規化: コンピ指数は外国産/地方馬に「外 ○○」「地 ○○」の接頭辞付き・他テーブル(レース情報/競走結果/調教/厩舎の話)は接頭辞なし。コンピ由来の辞書出力キーを正規化し、レース情報plain名で引くメインループと一致させる([[compi-index]])。
+function NormName([string]$n){ $t=@($n -split '[\s　]+' | Where-Object{$_ -ne ''}); if($t.Count -ge 1){ $t[-1] } else { $n } }
+
 # コンピ指数が前走から大幅下降(今走指数−前走指数≤-10)=格上挑戦の目安。コンピ1位軸の割引に使う。馬名->bool
 #   検証: コンピ1位でも大幅下降だと複勝54.8%(他の1位は約63%)。順位で割ると変化は概ね無効=これは1位の格上挑戦警告用。
 function Compute-CompiDrop([string]$v,[string]$d,[int]$rno){
@@ -143,7 +165,7 @@ function Compute-CompiDrop([string]$v,[string]$d,[int]$rno){
     $pr=Invoke-Rows "SELECT TOP 1 CAST(指数 AS int) idx FROM コンピ指数 WHERE 馬名=@h AND 開催日<@d AND 開催日>=@m AND 指数 IS NOT NULL ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d;'@m'=$m}
     $dg=$false
     if($pr.Count -ge 1 -and $pr[0].idx -isnot [DBNull]){ if(($ci-[int]$pr[0].idx) -le -10){ $dg=$true } }
-    $flag[$h]=$dg }
+    $flag[(NormName $h)]=$dg }
   return $flag
 }
 
@@ -157,7 +179,7 @@ function Compute-CompiDecline2([string]$v,[string]$d,[int]$rno){
     $pr=Invoke-Rows "SELECT TOP 2 CAST(指数 AS int) idx FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 開催日,開催場所,レース番号 ORDER BY 取得日時 DESC) rr FROM コンピ指数 WHERE 馬名=@h AND 開催日<@d AND 指数 IS NOT NULL) z WHERE z.rr=1 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
     $dg=$false
     if($pr.Count -ge 2 -and $pr[1].idx -isnot [DBNull]){ if(([int]$pr[1].idx - $ci) -ge 8){ $dg=$true } }
-    $flag[$h]=$dg }
+    $flag[(NormName $h)]=$dg }
   return $flag
 }
 
@@ -173,7 +195,7 @@ function Compute-CompiRise([string]$v,[string]$d,[int]$rno,[int]$Delta=4){
       $i1=[int]$pr[0].idx; $i2=[int]$pr[1].idx
       if(($ci-$i1) -ge $Delta -and ($i1-$i2) -ge $Delta){ $rise=$true }
     }
-    $flag[$h]=$rise }
+    $flag[(NormName $h)]=$rise }
   return $flag
 }
 
@@ -183,7 +205,7 @@ function Compute-CompiRise([string]$v,[string]$d,[int]$rno,[int]$Delta=4){
 function Compute-CompiStable([string]$v,[string]$d,[int]$rno,[int]$T=3,[int]$Hi=73){
   $cur=Invoke-Rows "SELECT 馬名,指数順位 FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 取得日時 DESC) rn FROM コンピ指数 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r AND 指数順位 IS NOT NULL) t WHERE rn=1" @{'@d'=$d;'@v'=$v;'@r'=$rno}
   $flag=@{}
-  foreach($e in $cur){ $h=[string]$e.馬名; if($e.指数順位 -is [DBNull]){ continue }; $ci=[int]$e.指数順位; if($ci -gt $T){ $flag[$h]=''; continue }
+  foreach($e in $cur){ $h=[string]$e.馬名; if($e.指数順位 -is [DBNull]){ continue }; $ci=[int]$e.指数順位; if($ci -gt $T){ $flag[(NormName $h)]=''; continue }
     $pr=Invoke-Rows "SELECT TOP 3 指数順位 r,CAST(指数 AS int) val FROM (SELECT 指数順位,指数,開催日,レース番号,ROW_NUMBER() OVER(PARTITION BY 開催日,開催場所,レース番号 ORDER BY 取得日時 DESC) rr FROM コンピ指数 WHERE 馬名=@h AND 開催日<@d AND 指数順位 IS NOT NULL) z WHERE z.rr=1 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
     $st=''
     if($pr.Count -ge 1 -and $pr[0].r -isnot [DBNull] -and [int]$pr[0].r -le $T){
@@ -193,7 +215,7 @@ function Compute-CompiStable([string]$v,[string]$d,[int]$rno,[int]$T=3,[int]$Hi=
         if($vals.Count -ge 3 -and (($vals|Measure-Object -Average).Average) -ge $Hi){ $st='安★' }
       }
     }
-    $flag[$h]=$st }
+    $flag[(NormName $h)]=$st }
   return $flag
 }
 
@@ -341,6 +363,152 @@ function Compute-TrajFlags($v,$d,$rno){
   return $map
 }
 
+# 不調(前3走3着内0)/相性悪(同条件過去複勝率<34%,N>=3)のセル別「消し」。検証2026-07-03(コンピ1位でも複勝-6〜-13pt年別頑健[[jra-axis-danger]]系)。
+#   不調=ダ短/ダマ/ダ中/芝短/芝中で強(芝マ弱・障外) / 相性悪=芝中/ダ中/芝短で強。相手を△に格下げ・軸は▽注記(確度・+EV無=掛金/EV不干渉)。
+# 消し要素(前走大敗/長期休養明け/種別替わり)。検証2026-07-03(C:\jra\analysis\jra-negsweep.ps1 + セル別jra-negsweep-cell.ps1・全JRA2022-26):
+#   前敗=前走で出走頭数の下位30%(着順/頭数>=0.7)→複勝C1-13.7/C2-3-7.6pt。ほぼ全セル全年頑健(芝マ/芝長上位のみ弱)。時計基準の危が取りこぼす頭数比着順下位を捕捉。全セル発火。
+#   長休=中17週(120日)+の休養明け→★ダート限定(ダ短-9.1/ダマ-12.0/ダ中-7.2上位)。芝は全年頑健でない(芝は休み明け巻き返し)ので今走ダートのみ発火。既存の休(8週×体重減)と別・体重発表前でも作動。
+#   種別替=前走と今走で芝/ダが変わる→★ダート替わり(ダ短-8.6/ダ中-10.3)と芝短替わり(-6.7)で全年頑健。既存の種別適性-(過去その面で実績悪)が捕らえない「替わり初戦(実績薄)」を捕捉=相補。今走ダート or 芝短で発火。
+#   ※競合先行/延長/短縮/斤量増/高齢はセル別でも全て非頑健=不採用(価格化)。
+function Compute-PrevNeg($v,$d,$rno){
+  $map=@{}
+  $tc=Invoke-Rows "SELECT TOP 1 コース種別 surf,TRY_CAST(距離 AS int) dist FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  if($tc.Count -lt 1 -or $null -eq $tc[0].dist){ return $map }
+  $tsurf= if("$($tc[0].surf)" -match 'ダ'){'ダ'}else{'芝'}; $td=[int]$tc[0].dist
+  $tband= if($td -le 1400){'短'}elseif($td -le 1799){'マ'}elseif($td -le 2200){'中'}else{'長'}
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $pv=Invoke-Rows "SELECT TOP 1 CONVERT(varchar(10),k.開催日,23) pd,TRY_CONVERT(int,k.着順) ch,ri2.コース種別 psurf,(SELECT COUNT(*) FROM 競走結果 z WHERE z.開催場所=k.開催場所 AND z.開催日=k.開催日 AND z.レース番号=k.レース番号 AND TRY_CONVERT(int,z.着順)>0) pf FROM 競走結果 k JOIN レース情報 ri2 ON ri2.開催場所=k.開催場所 AND ri2.開催日=k.開催日 AND ri2.レース番号=k.レース番号 AND ri2.馬番=k.馬番 WHERE k.馬名=@h AND k.開催日<@d AND TRY_CONVERT(int,k.着順)>0 ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    if($pv.Count -lt 1){ continue }
+    $fl=@{}
+    $pch=[int]$pv[0].ch; $pf=[int]$pv[0].pf
+    if($pf -ge 6 -and ($pch/[double]$pf) -ge 0.7){ $fl.prevloss=1 }                       # 前走大敗(下位3割)=全セル
+    $gap= try{ ([datetime]$d - [datetime]([string]$pv[0].pd)).Days }catch{ 0 }
+    if($gap -ge 120 -and $tsurf -eq 'ダ'){ $fl.longlay=1 }                                # 長期休養明け(17週+)=ダート限定
+    $psurf= if("$($pv[0].psurf)" -match 'ダ'){'ダ'}else{'芝'}
+    if($psurf -ne $tsurf -and ($tsurf -eq 'ダ' -or ($tsurf -eq '芝' -and $tband -eq '短'))){ $fl.surfsw=1 }  # 種別替=ダート替わり/芝短替わり
+    if($fl.Count){ $map[$h]=$fl }
+  }
+  return $map
+}
+
+# 消し要素=中団勢の上り3F順位 大幅悪化(末落)。中団(直近3走4角相対平均∈[1/3,2/3))で、前々走→前走の上り3Fレース内percentile(小=速)が+0.25以上悪化=決め手の減衰。
+#   検証2026-07-11(C:\jra\analysis\zenso-jra-verify\analyze_agari_delta.py・芝全+ダ≥1700・2023-2025・コンピ不使用): 大幅悪化(Δ≥+0.25)の中団馬は複勝率18.5%・年別18.8/19.4/17.4%と全年で中団baseline(22-24%)を4〜6pt下回る。着順ベース好走とは独立(決め手減衰)の危険フィルタ。良化は複勝率を押し上げず(横ばい最良)+EV無=消し専用。[[jra-zenso-midpack-nontransfer]]
+function Compute-AgariDecay($v,$d,$rno){
+  $map=@{}
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $pv=Invoke-Rows "SELECT TOP 3 TRY_CONVERT(int,k.四コーナー) c4,(SELECT COUNT(*) FROM 競走結果 z WHERE z.開催場所=k.開催場所 AND z.開催日=k.開催日 AND z.レース番号=k.レース番号 AND TRY_CONVERT(int,z.着順)>0) fn,(SELECT COUNT(*) FROM 競走結果 z WHERE z.開催場所=k.開催場所 AND z.開催日=k.開催日 AND z.レース番号=k.レース番号 AND TRY_CAST(z.上り3F AS float)>0) m,(SELECT COUNT(*) FROM 競走結果 z WHERE z.開催場所=k.開催場所 AND z.開催日=k.開催日 AND z.レース番号=k.レース番号 AND TRY_CAST(z.上り3F AS float)>0 AND TRY_CAST(z.上り3F AS float) < TRY_CAST(k.上り3F AS float)) faster FROM 競走結果 k WHERE k.馬名=@h AND k.開催日<@d AND TRY_CONVERT(int,k.着順)>0 ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    if($pv.Count -lt 2){ continue }                                          # 前走・前々走の両方が必要
+    $c4rel=@(); $agpct=@()
+    foreach($r in $pv){
+      $cr= if($r.fn -isnot [DBNull] -and [int]$r.fn -gt 1 -and $r.c4 -isnot [DBNull] -and [int]$r.c4 -gt 0){ ([int]$r.c4-1)/([double]([int]$r.fn-1)) }else{ $null }
+      $ap= if($r.m -isnot [DBNull] -and [int]$r.m -gt 1 -and $r.faster -isnot [DBNull]){ [int]$r.faster/([double]([int]$r.m-1)) }else{ $null }
+      $c4rel+=,$cr; $agpct+=,$ap }
+    $pos=@($c4rel|Where-Object{$null -ne $_}); if($pos.Count -lt 1){ continue }
+    $posavg=($pos|Measure-Object -Average).Average                            # 中団判定=直近3走4角相対平均
+    if(-not ($posavg -ge (1/3) -and $posavg -lt (2/3))){ continue }           # 中団勢のみ
+    if($null -eq $agpct[0] -or $null -eq $agpct[1]){ continue }
+    if(($agpct[0]-$agpct[1]) -ge 0.25){ $map[$h]=1 }                          # 前々走→前走で上り3F順位が+0.25以上悪化=末落
+  }
+  return $map
+}
+
+# 条件適性(差分適性)=「過去その条件での複勝率」-「過去全体の複勝率」。自分の平均よりこの条件で上げる/下げる個体固有の適性(全体能力の交絡を除去)。
+#   検証2026-07-03(C:\jra\analysis\jra-aptitude-proven.ps1・全JRA2022-26・コンピ帯統制): 種別(芝/ダ)=適性+で本命芝+6.7/ダ+5.4pt・芝C4-6+5.1pt / 適性-はダC4-6で-11pt。距離両極(短/長)=短C1+6.2/長C1+9.9等。全年頑健。マ/中距離・場・回りはフラット(価格化)で不採用。残差×条件替わり(延長/短縮/同条件-替わり型)も平均回帰でフラット=不採用。
+function Compute-CondApt($v,$d,$rno){
+  $map=@{}
+  $tc=Invoke-Rows "SELECT TOP 1 コース種別 surf,TRY_CAST(距離 AS int) dist FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  if($tc.Count -lt 1 -or $null -eq $tc[0].dist){ return $map }
+  $tsurf= if("$($tc[0].surf)" -match 'ダ'){'ダ'}else{'芝'}; $td=[int]$tc[0].dist
+  $tband= if($td -le 1400){'短'}elseif($td -le 1799){'マ'}elseif($td -le 2200){'中'}else{'長'}
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $hist=Invoke-Rows "SELECT TRY_CONVERT(int,k.着順) ch,ri.コース種別 s,TRY_CAST(ri.距離 AS int) dist FROM 競走結果 k JOIN レース情報 ri ON ri.開催場所=k.開催場所 AND ri.開催日=k.開催日 AND ri.レース番号=k.レース番号 AND ri.馬番=k.馬番 WHERE k.馬名=@h AND k.開催日<@d AND TRY_CONVERT(int,k.着順)>0" @{'@h'=$h;'@d'=$d}
+    $oN=0;$oT3=0;$sN=0;$sT3=0;$bN=0;$bT3=0
+    foreach($rr in $hist){ if($null -eq $rr.ch){continue}; $oN++; $t3=([int]$rr.ch -le 3); if($t3){$oT3++}
+      $rs= if("$($rr.s)" -match 'ダ'){'ダ'}else{'芝'}; if($rs -eq $tsurf){ $sN++; if($t3){$sT3++} }
+      if($null -ne $rr.dist){ $rd=[int]$rr.dist; $rb= if($rd -le 1400){'短'}elseif($rd -le 1799){'マ'}elseif($rd -le 2200){'中'}else{'長'}; if($rb -eq $tband){ $bN++; if($t3){$bT3++} } } }
+    if($oN -lt 5){ continue }
+    $fl=@{}; $ob=$oT3/$oN
+    if($sN -ge 3){ $ds=($sT3/$sN)-$ob; if($ds -ge 0.12){$fl.surf='+'}elseif($ds -le -0.12){$fl.surf='-'} }   # 種別適性(全帯)
+    if(($tband -eq '短' -or $tband -eq '長') -and $bN -ge 3){ $db=($bT3/$bN)-$ob; if($db -ge 0.12){$fl.dist='+'}elseif($db -le -0.12){$fl.dist='-'} }   # 距離両極のみ
+    if($fl.Count){ $map[$h]=$fl }
+  }
+  return $map
+}
+
+# 予測脚質(全頭・地方buyme/shutuba/blendと同一定義)=直近5走(183日内)の 生1角平均≤1.5=逃げ / 正規化平均通過≤0.33=先行 / ≤0.66=差し / 他=追込。通知(メール/チャット)表示用。
+function Compute-Style($v,$d,$rno){
+  $map=@{}
+  $rows=Invoke-Rows "WITH e AS (SELECT DISTINCT 馬名 FROM dbo.レース情報 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r), runs AS (SELECT cr.馬名, COALESCE(NULLIF(cr.一コーナー,0),NULLIF(cr.二コーナー,0),NULLIF(cr.三コーナー,0),NULLIF(cr.四コーナー,0)) early, (SELECT AVG(x*1.0) FROM (VALUES(NULLIF(cr.一コーナー,0)),(NULLIF(cr.二コーナー,0)),(NULLIF(cr.三コーナー,0)),(NULLIF(cr.四コーナー,0))) t(x) WHERE x IS NOT NULL) posavg, (SELECT COUNT(1) FROM dbo.競走結果 z WHERE z.開催日=cr.開催日 AND z.開催場所=cr.開催場所 AND z.レース番号=cr.レース番号 AND z.着順>0) ptou, ROW_NUMBER() OVER(PARTITION BY cr.馬名 ORDER BY cr.開催日 DESC, cr.レース番号 DESC) rn FROM dbo.競走結果 cr JOIN e ON e.馬名=cr.馬名 WHERE cr.開催日<@d AND cr.開催日>=DATEADD(day,-183,@d) AND cr.着順>0 AND cr.走破時計>0) SELECT 馬名, early, posavg, ptou FROM runs WHERE rn<=5 AND posavg IS NOT NULL AND ptou>0" @{'@d'=$d;'@v'=$v;'@r'=$rno}
+  $acc=@{}
+  foreach($x in $rows){ $nm="$($x.馬名)"; if(-not $acc.ContainsKey($nm)){ $acc[$nm]=@{e=New-Object System.Collections.Generic.List[double]; m=New-Object System.Collections.Generic.List[double]} }
+    if($x.early -isnot [DBNull]){ $acc[$nm].e.Add([double]$x.early) }
+    $acc[$nm].m.Add([double]$x.posavg/[double]$x.ptou) }
+  foreach($nm in $acc.Keys){ $a=$acc[$nm]; if($a.m.Count -lt 1){ continue }
+    $me= if($a.e.Count -ge 1){ ($a.e|Measure-Object -Average).Average }else{ 99 }
+    $mr= ($a.m|Measure-Object -Average).Average
+    $map[$nm]= if($me -le 1.5){'逃げ'}elseif($mr -le 0.33){'先行'}elseif($mr -le 0.66){'差し'}else{'追込'} }
+  return $map
+}
+
+# 前走完勝フォーム=前走で先行(逃/先)かつ上り3F上位25%(前につけて上りも速い=完勝)。純フォーム(コンピ不使用)の好調シグナル。
+#   検証2026-07-03(C:\jra\analysis\jra-cell-form.ps1 + jra-form-incremental.ps1・全JRA2022-26): 複勝率44.4%(base22.4%)・連好と58.5%非重複(連好でない馬でも複勝41.3%)=既存連好/末★の取りこぼしを捕捉する独立確度。市場価格化で+EVは無く確度専用。
+function Compute-PrevDom($v,$d,$rno){
+  $map=@{}
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $pv=Invoke-Rows "SELECT TOP 1 TRY_CONVERT(int,k.四コーナー) c4,(SELECT COUNT(*) FROM 競走結果 z WHERE z.開催場所=k.開催場所 AND z.開催日=k.開催日 AND z.レース番号=k.レース番号 AND TRY_CONVERT(int,z.着順)>0) fn,(SELECT COUNT(*) FROM 競走結果 z WHERE z.開催場所=k.開催場所 AND z.開催日=k.開催日 AND z.レース番号=k.レース番号 AND TRY_CAST(z.上り3F AS float)>0 AND TRY_CAST(z.上り3F AS float) < TRY_CAST(k.上り3F AS float)) faster FROM 競走結果 k WHERE k.馬名=@h AND k.開催日<@d AND TRY_CONVERT(int,k.着順)>0 AND k.四コーナー>0 AND TRY_CAST(k.上り3F AS float)>0 ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    if($pv.Count -lt 1 -or $null -eq $pv[0].fn -or [int]$pv[0].fn -le 1){ continue }
+    $c4=[int]$pv[0].c4; $fn=[int]$pv[0].fn; $agrank=[int]$pv[0].faster + 1
+    $fwd= ($c4 -le 1 -or ($c4/[double]$fn) -le 0.34)                     # 前走=逃/先
+    $fast= (($agrank/[double]$fn) -le 0.25)                               # 前走上り3F上位25%
+    if($fwd -and $fast){ $map[$h]=1 }
+  }
+  return $map
+}
+
+# 展開的適性=単騎速(フィールドで先行馬[逃/先]が自分1頭のみ=マイペースの逃げ)。各馬の前走四コーナー/頭数で脚質判定。
+#   検証2026-07-03(C:\jra\analysis\jra-pace-fit.ps1): 単騎速×コンピ1位=複勝76.2%(base63.3%・+13pt)全5年頑健(68-80%)/コンピ2-3も4/5年base超。前残り場は単勝108-115%(+EV候補・n小監視)。h2h/コンピが測れないフィールド相互作用=正の確度。
+function Compute-PaceFit($v,$d,$rno){
+  $map=@{}
+  $ent=Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  $styles=@{}
+  foreach($e in $ent){ $h=[string]$e.馬名
+    $pv=Invoke-Rows "SELECT TOP 1 k.四コーナー c4,(SELECT COUNT(*) FROM 競走結果 z WHERE z.開催場所=k.開催場所 AND z.開催日=k.開催日 AND z.レース番号=k.レース番号 AND TRY_CONVERT(int,z.着順)>0) fn FROM 競走結果 k WHERE k.馬名=@h AND k.開催日<@d AND TRY_CONVERT(int,k.着順)>0 AND k.四コーナー>0 ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$d}
+    if($pv.Count -ge 1 -and $pv[0].c4 -isnot [DBNull] -and [int]$pv[0].fn -gt 1){ $c4=[int]$pv[0].c4; $fn=[int]$pv[0].fn; $rat=$c4/[double]$fn
+      $styles[$h]= if($c4 -le 1){'逃'}elseif($rat -le 0.34){'先'}elseif($rat -le 0.66){'差'}else{'追'} } }
+  $speed=@($styles.Keys|Where-Object{ $styles[$_] -eq '逃' -or $styles[$_] -eq '先' })
+  if($speed.Count -eq 1){ $map[$speed[0]]=$styles[$speed[0]] }   # 先行馬が1頭のみ=その馬が単騎速(マイペース)。値=前走脚質(逃/先): 前走逃げは真の単騎逃げ(複勝率↑)([[jra-pace-fit]])
+  return $map
+}
+
+function Compute-FormApt($v,$d,$rno){
+  $map=@{}
+  $tr=Invoke-Rows "SELECT TOP 1 コース種別,TRY_CAST(距離 AS int) dist FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno}
+  if($tr.Count -eq 0 -or $tr[0].dist -is [DBNull]){ return $map }
+  $tSurf=[string]$tr[0].コース種別; $tDist=[int]$tr[0].dist
+  $band= if($tDist -le 1400){'短'}elseif($tDist -le 1799){'マ'}elseif($tDist -le 2200){'中'}else{'長'}
+  $cell="$tSurf$band"
+  $doFu = @('ダ短','ダマ','ダ中','芝短','芝中') -contains $cell   # 不調が強い消しセル(-8〜-13pt/年別頑健)
+  $doAw = @('芝中','ダ中','芝短') -contains $cell                 # 相性悪が強い消しセル(-6〜-9pt/年別頑健)
+  if(-not $doFu -and -not $doAw){ return $map }
+  foreach($e in (Invoke-Rows "SELECT 馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$v;'@d'=$d;'@r'=$rno})){
+    $h=[string]$e.馬名; $fl=@()
+    if($doFu){
+      $p3=Invoke-Rows "SELECT TOP 3 TRY_CAST(着順 AS int) rk FROM 競走結果 WHERE 馬名=@h AND 開催日<@d AND TRY_CAST(着順 AS int)>0 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$d}
+      if($p3.Count -ge 3 -and @($p3|Where-Object{[int]$_.rk -le 3}).Count -eq 0){ $fl+='不調' }
+    }
+    if($doAw){
+      $ap=Invoke-Rows "SELECT COUNT(*) n,SUM(CASE WHEN TRY_CAST(k.着順 AS int)<=3 THEN 1 ELSE 0 END) w FROM 競走結果 k JOIN レース情報 ri ON ri.開催場所=k.開催場所 AND ri.開催日=k.開催日 AND ri.レース番号=k.レース番号 AND ri.馬番=k.馬番 WHERE k.馬名=@h AND k.開催日<@d AND TRY_CAST(k.着順 AS int)>0 AND ri.コース種別=@s AND ABS(TRY_CAST(ri.距離 AS int)-@dist)<=200" @{'@h'=$h;'@d'=$d;'@s'=$tSurf;'@dist'=$tDist}
+      if($ap.Count -ge 1 -and $ap[0].n -isnot [DBNull] -and [int]$ap[0].n -ge 3 -and ([double][int]$ap[0].w/[int]$ap[0].n) -lt 0.34){ $fl+='相悪' }
+    }
+    if($fl.Count){ $map[$h]=($fl -join '') }
+  }
+  return $map
+}
+
 # 前々走×前走の「内容一貫性」(検証[[jra-course-agari]]・上り順位はレース内RANK相対/位置は四角通過率)。
 #   ★確度: 連脚=2走連続で前付け(四角前1/3)×上り上位(レース内3位内)=今走複勝50%級・全年頑健 / 連上=2走連続上り上位(複37%)
 #   ★消し: 連後=2走連続後方(四角後1/3)=複7-10%・全年頑健・単回収51-62%割れ(過剰人気で消す実益)
@@ -474,7 +642,7 @@ try {
   foreach($rno in $races){
     $ent=Invoke-Rows "SELECT 馬番,馬名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r ORDER BY 馬番" @{'@v'=$Venue;'@d'=$Date;'@r'=$rno}
     if($ent.Count -eq 0){ continue }
-    $h2h=Compute-H2h $Venue $Date $rno
+    $h2hR=Compute-H2h $Venue $Date $rno; $h2h=$h2hR.score; $h2hCov=$h2hR.cov
     $distRows=Invoke-Rows "SELECT TOP 1 距離,コース種別,条件,発走時刻,競走名 FROM レース情報 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r" @{'@v'=$Venue;'@d'=$Date;'@r'=$rno}
     $dist= if($distRows.Count -gt 0 -and $distRows[0].距離 -isnot [DBNull]){[int]$distRows[0].距離}else{0}
     $surf= if($distRows.Count -gt 0){[string]$distRows[0].コース種別}else{''}
@@ -496,26 +664,53 @@ try {
     $layoff= Compute-LayoffWeight $Venue $Date $rno # 休み明け(中8週+)×馬体重減: 相手消し用([[jra-layoff-weight]])
     $wgain= Compute-WeightGain $Venue $Date $rno $WeightGainThresh # 馬体重大幅増(+8kg〜)×軸=過剰人気割引([[jra-meeting-rotation]])
     $traj= Compute-TrajFlags $Venue $Date $rno      # 着順/クラス/コース変遷(確度:連好/降2・消し:失速/ダ替)[[jra-axis-trajectory]]
+    $formapt= Compute-FormApt $Venue $Date $rno     # セル別消し(不調=前3走3着内0 / 相性悪=同条件過去複勝率<34%)。検証2026-07-03
+    $pacefit= Compute-PaceFit $Venue $Date $rno     # 展開的適性=単騎速(先行馬1頭のみ)。複勝+13pt全年頑健。検証2026-07-03
+    $condapt= Compute-CondApt $Venue $Date $rno     # 条件適性(差分)=種別(芝/ダ)+距離両極(短/長)で個体固有適性。正負確度。検証2026-07-03
+    $prevneg= Compute-PrevNeg $Venue $Date $rno     # 消し要素=前走大敗(頭数下位30%)/長期休養明け(120日+)。全年頑健。検証2026-07-03
+    $agdecay= Compute-AgariDecay $Venue $Date $rno  # 消し要素=末落(中団勢の上り3F順位 前々走→前走で大幅悪化)。複勝率18.5%全年抑制。検証2026-07-11
+    $prevdom= Compute-PrevDom $Venue $Date $rno     # 前走完勝(先行×上り速)=純フォームの好調確度。複勝44%・連好と独立。検証2026-07-03
     $cons= Compute-Consistency $Venue $Date $rno    # 前々走×前走の内容一貫(確度:連脚/連上・消し:連後)[[jra-course-agari]]
     $rota= Compute-RotaFlags $Venue $Date $rno      # コースローテ割引(延長=全場・遠征=東中小中山)[[jra-meeting-rotation]]
     $lym= if($W_rota -ne 0){ Compute-LastYearMatch $Venue $Date $rno }else{ @{} }  # 昨年同開催の好走馬プロファイル合致度(軸ブースト)
     $jsw= Compute-JockeySwitch $Venue $Date $rno   # 騎手乗り替わり(穴×地力で乗替穴軸シグナル)[[keiba-universal-signals]]
-    $h2hMap=@{}; $v3Map=@{}; $cpMap=@{}; $frMap=@{}; $simMap=@{}
+    $h2hMap=@{}; $v3Map=@{}; $cpMap=@{}; $frMap=@{}; $simMap=@{}; $h2hCovU=@{}
     foreach($e in $ent){ $u=[int]$e.馬番; $nm=[string]$e.馬名; $key="$rno|$u"
       if($h2h.ContainsKey($nm)){ $h2hMap[$u]=[double]$h2h[$nm] }
+      if($h2hCov.ContainsKey($nm)){ $h2hCovU[$u]=[double]$h2hCov[$nm] }
       if($V3.ContainsKey($key)){ $v3Map[$u]=[double]$V3[$key].v3 }
       if($cp.ContainsKey($key)){ $cpMap[$u]= -1.0*$cp[$key] }   # 指数順位は小さいほど良い→符号反転
       if($front.ContainsKey($nm) -and $front[$nm].np -ge 2 -and $null -ne $front[$nm].lead){ $frMap[$u]=[double]$front[$nm].lead }
       if($lym.ContainsKey($nm)){ $simMap[$u]=[double]$lym[$nm] }
     }
+    # ★h2h順位(実力馬ラベル用・2026-07-11): h2hスコア降順で1位から採番(高い=強い)。h2h算出不能な馬は順位なし(0)。実力馬=単騎速×コンピ≤6×h2h順位≤3([[jra-pace-fit]]BT複勝63→70.5%・地方実力馬と定義統一)。
+    $h2hRankNm=@{}; $h2hri=1; foreach($kv in ($h2h.GetEnumerator()|Sort-Object Value -Descending)){ $h2hRankNm[$kv.Key]=$h2hri; $h2hri++ }
     $zh=ZMap $h2hMap; $zv=ZMap $v3Map; $zc=ZMap $cpMap; $zf=ZMap $frMap; $zr=ZMap $simMap
     $out=foreach($e in $ent){ $u=[int]$e.馬番; $nm=[string]$e.馬名; $key="$rno|$u"
       $parts=@(); $tot=0.0
-      if($zh.ContainsKey($u)){ $tot+=$W_h2h*$zh[$u]; $parts+='h' }
+      if($zh.ContainsKey($u)){
+        # ★h2h信頼度スケール(診断2026-07-03): 共通対戦の被覆率で重み可変(薄いほどコンピ/V3にフォールバック)+コンピ合議ゲート(h2hがコンピ4位以下を押し上げる=非信頼で半減)。-NoH2hRelで無効。
+        $wh=$W_h2h
+        if(-not $NoH2hRel){
+          $cvv= if($h2hCovU.ContainsKey($u)){$h2hCovU[$u]}else{0}
+          $rel=[math]::Max(0.3,[math]::Min(1.0,$cvv/0.7))
+          $crk1= if($cp.ContainsKey($key) -and "$($cp[$key])" -match '^\d+$'){[int]$cp[$key]}else{99}
+          if($crk1 -ge 4 -and $zh[$u] -gt 0){ $rel*=0.5 }   # h2hがコンピ4位以下を上位に押す=上書き方向=非信頼(複勝17.4%)
+          $wh=$W_h2h*$rel
+        }
+        $tot+=$wh*$zh[$u]; $parts+='h' }
       if($zv.ContainsKey($u)){ $tot+=$W_v3*$zv[$u]; $parts+='v' }
       if($zc.ContainsKey($u)){ $tot+=$W_compi*$zc[$u]; $parts+='c' }
       if($zf.ContainsKey($u)){ $tot+=$W_front*$zf[$u]; $parts+='f' }
       if($zr.ContainsKey($u)){ $tot+=$W_rota*$zr[$u]; $parts+='r' }   # 昨年好走プロファイル合致度ブースト([[jra-meeting-rotation]])
+      # 単騎速(展開適性・先行馬1頭のみ=マイペース逃げ): コンピ上位(≤6)へ総合ブースト。複勝+13pt全年頑健。検証2026-07-03([[jra-pace-fit]])。-NoLoneSpeedで無効
+      if(-not $NoLoneSpeed -and $pacefit.ContainsKey($nm)){ $lsc= if($cp.ContainsKey($key) -and "$($cp[$key])" -match '^\d+$'){[int]$cp[$key]}else{99}; if($lsc -le 6){ $tot+=$LoneSpeedBoost; $parts+='L' } }
+      # 前走完勝(先行×上り速)=純フォーム好調確度(複勝44%・連好と独立)。コンピ上位(≤6)に総合加点。検証2026-07-03([[jra-form-cell]])。-NoPrevDomで無効
+      if(-not $NoPrevDom -and $prevdom.ContainsKey($nm)){ $pdc= if($cp.ContainsKey($key) -and "$($cp[$key])" -match '^\d+$'){[int]$cp[$key]}else{99}; if($pdc -le 6){ $tot+=$PrevDomBoost; $parts+='D' } }
+      # 条件適性(差分・種別/距離両極): 適性+で総合加点/適性-で減点。複勝±5〜11pt全年頑健。検証2026-07-03([[jra-condition-aptitude]])。-NoCondAptで無効
+      if(-not $NoCondApt -and $condapt.ContainsKey($nm)){ $f=$condapt[$nm]
+        if(($f.surf -eq '-') -or ($f.dist -eq '-')){ $tot-=($CondAptBoost*1.25); $parts+='A' }
+        elseif(($f.surf -eq '+') -or ($f.dist -eq '+')){ $tot+=$CondAptBoost; $parts+='A' } }
       $lead= if($front.ContainsKey($nm)){$front[$nm].lead}else{$null}
       $np= if($front.ContainsKey($nm)){$front[$nm].np}else{0}
       $senStyle= if($null -eq $lead -or $np -lt 2){''} elseif($lead -ge 0.7){'逃'} elseif($lead -ge 0.45){'先'} elseif($lead -ge 0.2){'差'} else {'追'}
@@ -544,6 +739,17 @@ try {
         _pst= if($pstyle.ContainsKey($nm)){$pstyle[$nm]}else{$null}
         遠= if($ensei.ContainsKey($nm)){[string]$ensei[$nm]}else{''}
         休= if($layoff.ContainsKey($nm)){[string]$layoff[$nm]}else{''}
+        不調= if($formapt.ContainsKey($nm) -and $formapt[$nm] -like '*不調*'){1}else{0}
+        相悪= if($formapt.ContainsKey($nm) -and $formapt[$nm] -like '*相悪*'){1}else{0}
+        単騎速= if(-not $NoLoneSpeed -and $pacefit.ContainsKey($nm)){1}else{0}
+        単騎脚= if($pacefit.ContainsKey($nm)){[string]$pacefit[$nm]}else{''}   # 単騎速馬の前走脚質(逃/先)。逃×コンピ≤3=鉄板地力先行
+        単騎h2h= if($h2hRankNm.ContainsKey($nm)){[int]$h2hRankNm[$nm]}else{0}   # h2h順位(実力馬=単騎速×コンピ≤6×h2h≤3判定用)
+        完= if(-not $NoPrevDom -and $prevdom.ContainsKey($nm)){1}else{0}
+        適性= if(-not $NoCondApt -and $condapt.ContainsKey($nm)){ $f=$condapt[$nm]; $pos=(($f.surf -eq '+') -or ($f.dist -eq '+')); $neg=(($f.surf -eq '-') -or ($f.dist -eq '-')); if($neg){'-'}elseif($pos){'+'}else{''} }else{''}
+        前敗= if(-not $NoPrevNeg -and $prevneg.ContainsKey($nm) -and $prevneg[$nm].prevloss -eq 1){1}else{0}
+        長休= if(-not $NoPrevNeg -and $prevneg.ContainsKey($nm) -and $prevneg[$nm].longlay -eq 1){1}else{0}
+        種替= if(-not $NoPrevNeg -and $prevneg.ContainsKey($nm) -and $prevneg[$nm].surfsw -eq 1){1}else{0}
+        末落= if(-not $NoAgariDecay -and $agdecay.ContainsKey($nm)){1}else{0}
         増= if($wgain.ContainsKey($nm)){$true}else{$false}
         遷= if($traj.ContainsKey($nm)){[string]$traj[$nm]}else{''}
         連= if($cons.ContainsKey($nm)){[string]$cons[$nm]}else{''}
@@ -589,8 +795,28 @@ try {
       #   検証([[jra-layoff-weight]]): 休明×減-6〜は複勝17-19%(減-10〜15%)・全5年で他より-3〜7pt・単回収56%で過剰人気(消す実益)。当日体重発表後のみ作動。
       if($o.休 -eq '休消' -and $o.消 -ne 1){
         $lab= if($lab -like '○*'){'△休'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽休"} elseif($lab -eq '△'){'△休'} else {$lab} }
+      # ★セル別消し(検証2026-07-03・複勝-6〜-13pt年別頑健): 不調=前3走3着内0(ダ短/ダマ/ダ中/芝短/芝中) / 相性悪=同条件過去複勝率<34%(芝中/ダ中/芝短)。○相手→△に格下げ(相手から外す)・◎軸→▽注記。
+      if($o.不調 -eq 1 -and $o.消 -ne 1){ $lab= if($lab -like '○*'){'△不調'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽不調"} elseif($lab -eq '△'){'△不調'} else {$lab} }
+      if($o.相悪 -eq 1 -and $o.消 -ne 1){ $lab= if($lab -like '○*'){'△相悪'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽相悪"} elseif($lab -eq '△'){'△相悪'} else {$lab} }
+      # ★消し要素(検証2026-07-03・コンピ帯統制で全年頑健[[jra-negsweep]]): 前敗=前走頭数下位30%(C1-13.7/C2-3-7.6pt) / 長休=中17週+休養明け(C1-5.2/C2-3-6.1pt)。○相手→△格下げ・◎軸→▽注記。
+      if($o.前敗 -eq 1 -and $o.消 -ne 1){ $lab= if($lab -like '○*'){'△前敗'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽前敗"} elseif($lab -eq '△'){'△前敗'} else {$lab} }
+      if($o.長休 -eq 1 -and $o.消 -ne 1){ $lab= if($lab -like '○*'){'△長休'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽長休"} elseif($lab -eq '△'){'△長休'} else {$lab} }
+      if($o.種替 -eq 1 -and $o.消 -ne 1){ $lab= if($lab -like '○*'){'△種替'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽種替"} elseif($lab -eq '△'){'△種替'} else {$lab} }
+      # ★消し要素(検証2026-07-11[[jra-zenso-midpack-nontransfer]]): 末落=中団勢の上り3F順位が前々走→前走で大幅悪化(percentile+0.25↑)=決め手減衰→複勝率18.5%全年抑制(18.8/19.4/17.4%)。○相手→△格下げ・◎軸→▽注記。
+      if($o.末落 -eq 1 -and $o.消 -ne 1){ $lab= if($lab -like '○*'){'△末落'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽末落"} elseif($lab -eq '△'){'△末落'} else {$lab} }
       # 馬体重大幅増(+8kg〜)=軸の過剰人気割引([[jra-meeting-rotation]] rota_ev: コ1複勝60.4%/単回収63.5%=最低)。◎軸→▽増注記のみ(相手は据置=複勝率低下が小さいため軸の妙味警告に限定)。当日体重発表後のみ。
       if($o.増 -and $o.消 -ne 1 -and $lab -like '◎*' -and $lab -notlike '*危*'){ $lab="${lab}▽増" }
+      # 単騎速(展開適性=先行馬1頭のみのマイペース逃げ)=正の確度。◎/○/△に付記(危/消/格下げ時は付けない)。複勝+13pt全年頑健([[jra-pace-fit]])。
+      #   ★質の細分(2026-07-11): 単騎実力馬=単騎速×コンピ≤6×h2h順位≤3(BT複勝63→70.5%・h2h独立・全年頑健=地方と定義統一。2026-07-12「実力馬」→「単騎実力馬」改称=h2h実力馬[h2h1-2×コ4-7]と区別) / ⚡単鉄=前走逃げ×コンピ≤3(複勝66-87%) / ⚡単=その他単騎速×コ≤6。優先=単騎実力馬>⚡単鉄>⚡単。コンピ7位以下の単騎速は複勝率3%で無価値(コ≤6ゲート既存)。
+      if($o.単騎速 -eq 1 -and $o.消 -ne 1 -and ($lab -like '◎*' -or $lab -like '○*' -or $lab -eq '△') -and $lab -notlike '*危*' -and $lab -notlike '*▽*' -and $lab -notlike '*不調*' -and $lab -notlike '*相悪*'){
+        $lsc= if("$($o.コンピ)" -match '^\d+$'){[int]$o.コンピ}else{99}
+        $hrk= if("$($o.単騎h2h)" -match '^\d+$'){[int]$o.単騎h2h}else{0}
+        $lab= if($lsc -le 6 -and $hrk -ge 1 -and $hrk -le 3){"${lab}単騎実力馬"}elseif($o.単騎脚 -eq '逃' -and $lsc -le 3){"${lab}⚡単鉄"}else{"${lab}⚡単"} }
+      # 前走完勝(先行×上り速)=正の確度。◎/○/△に完を付記(危/消/格下げ時は付けない)。複勝44%・連好と独立([[jra-form-cell]])。
+      if($o.完 -eq 1 -and $o.消 -ne 1 -and ($lab -like '◎*' -or $lab -like '○*' -or $lab -eq '△') -and $lab -notlike '*危*' -and $lab -notlike '*▽*' -and $lab -notlike '*不調*' -and $lab -notlike '*相悪*'){ $lab="${lab}完" }
+      # 条件適性(種別/距離両極の差分適性)。適性-=○相手→△不適/◎軸→▽不適(消し寄り)、適性+=◎/○/△に適を付記。検証2026-07-03([[jra-condition-aptitude]])。
+      if($o.適性 -eq '-' -and $o.消 -ne 1){ $lab= if($lab -like '○*'){'△不適'} elseif($lab -like '◎*' -and $lab -notlike '*危*'){"${lab}▽不適"} elseif($lab -eq '△'){'△不適'} else {$lab} }
+      elseif($o.適性 -eq '+' -and $o.消 -ne 1 -and ($lab -like '◎*' -or $lab -like '○*' -or $lab -eq '△') -and $lab -notlike '*危*' -and $lab -notlike '*▽*' -and $lab -notlike '*不調*' -and $lab -notlike '*相悪*'){ $lab="${lab}適" }
       # 軸足切り(コンピ上位3)で総合1位から差し替えた軸=印に注記(総合1位がコンピ4位以下だったため)。
       if($o.足切 -and $lab -like '◎*'){ $lab="${lab}・コ足切" }
       # 前々走→前走→今走の変遷(確度/危険)[[jra-axis-trajectory]]。確度=連好/降2は◎/○に付記、消し=失速/ダ替は割引注記(危時は付けない)。
@@ -756,11 +982,23 @@ try {
       Write-Host ("  ○相手: " + (($aite|ForEach-Object{"{0}{1}(ネガ{2})" -f $_.馬番,$_.馬名,$_._neg}) -join '  '))
       continue
     }
+    if($ExportHorses){
+      # 全馬ダンプ(反省ログ用): 各馬の最終評価ラベル(⚡単/適/前敗/長休/種替/危/消 等込み)+コンピ+総合。結果と突合し消し精度・シグナル成否を検証。
+      foreach($o in $ranked){ Write-Output ("HORSE|{0}|{1}|{2}|{3}|{4}" -f $rno,$o.馬番,$o.評価,$o.コンピ,$o.総合) }
+    }
     if($ExportBets){
       # 軸=◎/注、相手=総合上位N(軸と消を除く)。機械可読: EXPORT|R|距離|軸馬番|軸評価|相手馬番カンマ
       $axis = $ranked | Where-Object { $_.評価 -like '◎*' -or $_.評価 -like '注*' } | Select-Object -First 1
       if($axis){
-        $partners=@($ranked | Where-Object { $_.評価 -ne '消' -and $_.遠 -ne '遠危' -and $_.休 -ne '休消' -and "$($_.馬番)" -ne "$($axis.馬番)" -and $null -ne $_.総合 } | Select-Object -First $ExportN | ForEach-Object { $_.馬番 })
+        # 相手=総合上位N(軸/消/遠危/休消除く)。ラベルネガ馬(前敗/危/不調/相悪/長休/種替/不適)は除外するが、
+        # ★相手フロア(既定ON・-NoRelayFloorで従来動作): コ順位<=RelayFloorCompi(3) or 総合>=RelayFloorSougou(0.6) のネガ馬は相手に残す([[jra-negsweep]]監査=コ/総合上位のネガ除外が最頻の取りこぼし)。
+        $baseC=@($ranked | Where-Object { $_.評価 -ne '消' -and $_.遠 -ne '遠危' -and $_.休 -ne '休消' -and "$($_.馬番)" -ne "$($axis.馬番)" -and $null -ne $_.総合 })
+        $isNeg  ={ param($h) "$($h.評価)" -match '危|不調|相悪|前敗|長休|種替|不適|末落' }
+        $floorOk={ param($h) (-not $NoRelayFloor) -and ( ("$($h.コンピ)" -match '^\d+$' -and [int]$h.コンピ -le $RelayFloorCompi) -or ($null -ne $h.総合 -and [double]$h.総合 -ge $RelayFloorSougou) ) }
+        $pick=@($baseC | Where-Object { $KeepNegPartners -or (-not (& $isNeg $_)) -or (& $floorOk $_) })
+        $partners=@($pick | Select-Object -First $ExportN | ForEach-Object { "$($_.馬番)" })
+        # ★相手拡幅(既定ON・-NoRelayWidenで無効): ExportN未満なら総合上位の残り(ネガ含む)で補充=薄すぎ回避。
+        if(-not $NoRelayWiden -and $partners.Count -lt $ExportN){ foreach($h in $baseC){ if($partners.Count -ge $ExportN){break}; $mb="$($h.馬番)"; if($partners -notcontains $mb){ $partners+=$mb } } }
         Write-Output ("EXPORT|{0}|{1}|{2}|{3}|{4}" -f $rno,$dist,$axis.馬番,$axis.評価,($partners -join ','))
       }
       continue
@@ -798,12 +1036,14 @@ try {
       }
     }
     if($Notify){
+      $stylemap = Compute-Style $Venue $Date $rno   # 予測脚質(地方buyme/shutubaと同一定義)=メール/チャットに脚質表示
       $axis = $ranked | Where-Object { $_.評価 -like '◎*' -or $_.評価 -like '注*' } | Select-Object -First 1
       $aite = @($ranked | Where-Object { $_.評価 -like '○*' } | Select-Object -First 3)
       # ○相手が危険軸降格等で皆無の時は総合上位(消除く・軸除く)を相手表示=買目ExportBetsと整合(2026-06-28 函館2Rで相手—誤表示→修正)
-      if($aite.Count -eq 0 -and $axis){ $aite = @($ranked | Where-Object { $_.馬番 -ne $axis.馬番 -and $_.消 -ne 1 -and $null -ne $_.総合 } | Select-Object -First 3) }
-      $axTxt = if($axis){ "{0} {1}{2}" -f $axis.評価,$axis.馬番,$axis.馬名 }else{ '—' }
-      $aiTxt = if($aite.Count){ ($aite | ForEach-Object { "{0}{1}" -f $_.馬番,$_.馬名 }) -join ' ' }else{ '—' }
+      if($aite.Count -eq 0 -and $axis){ $aite = @($ranked | Where-Object { $_.馬番 -ne $axis.馬番 -and $_.消 -ne 1 -and $null -ne $_.総合 -and ($KeepNegPartners -or ("$($_.評価)" -notmatch '危|不調|相悪|前敗|長休|種替|不適|末落')) } | Select-Object -First 3) }
+      $axSty = if($axis -and $stylemap.ContainsKey($axis.馬名)){' 脚質'+$stylemap[$axis.馬名]}else{''}
+      $axTxt = if($axis){ "{0} {1}{2}{3}" -f $axis.評価,$axis.馬番,$axis.馬名,$axSty }else{ '—' }
+      $aiTxt = if($aite.Count){ ($aite | ForEach-Object { $st= if($stylemap.ContainsKey($_.馬名)){'('+$stylemap[$_.馬名].Substring(0,1)+')'}else{''}; "{0}{1}{2}" -f $_.馬番,$_.馬名,$st }) -join ' ' }else{ '—' }
       $postTxt= if($post){ $post.ToString('HH:mm')+'発走 ' }else{'' }
       Write-Output ("{0,2}R({1}{2}m) 軸:{3}  相手:{4}{5}" -f $rno,$postTxt,$dist,$axTxt,$aiTxt,$confLbl)
       continue

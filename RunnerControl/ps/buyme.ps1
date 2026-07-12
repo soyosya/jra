@@ -51,6 +51,33 @@ WHERE cur.sn=1 ORDER BY cur.指数順位
 $field=@($hd.Rows | ForEach-Object { [string]$_.馬名 })
 $compiRk=@{}; $idxByRk=@{}; foreach($r in $hd.Rows){ $compiRk[[string]$r.馬名]=[int]$r.指数順位; if($r.指数 -isnot [DBNull]){ $idxByRk[[int]$r.指数順位]=[int]$r.指数 } }
 
+# 予測脚質(全頭・地方buyme/blendと同一定義): 直近5走(183日内)の 生1角平均≤1.5=逃げ / 正規化平均通過≤0.33=先行 / ≤0.66=差し / 他=追込
+$styleOf=@{}
+try{
+  $stDt=Q1 @"
+WITH e AS (SELECT DISTINCT 馬名 FROM dbo.レース情報 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r),
+runs AS (
+  SELECT cr.馬名,
+    COALESCE(NULLIF(cr.一コーナー,0),NULLIF(cr.二コーナー,0),NULLIF(cr.三コーナー,0),NULLIF(cr.四コーナー,0)) early,
+    (SELECT AVG(x*1.0) FROM (VALUES(NULLIF(cr.一コーナー,0)),(NULLIF(cr.二コーナー,0)),(NULLIF(cr.三コーナー,0)),(NULLIF(cr.四コーナー,0))) t(x) WHERE x IS NOT NULL) posavg,
+    (SELECT COUNT(1) FROM dbo.競走結果 z WHERE z.開催日=cr.開催日 AND z.開催場所=cr.開催場所 AND z.レース番号=cr.レース番号 AND z.着順>0) ptou,
+    ROW_NUMBER() OVER(PARTITION BY cr.馬名 ORDER BY cr.開催日 DESC, cr.レース番号 DESC) rn
+  FROM dbo.競走結果 cr JOIN e ON e.馬名=cr.馬名
+  WHERE cr.開催日<@d AND cr.開催日>=DATEADD(day,-183,@d) AND cr.着順>0 AND cr.走破時計>0
+)
+SELECT 馬名, early, posavg, ptou FROM runs WHERE rn<=5 AND posavg IS NOT NULL AND ptou>0
+"@ @{'@d'=$date;'@v'=$Venue;'@r'=$Race}
+  $stAcc=@{}
+  foreach($x in $stDt.Rows){ $nm2="$($x.馬名)"
+    if(-not $stAcc.ContainsKey($nm2)){ $stAcc[$nm2]=@{e=New-Object System.Collections.Generic.List[double]; m=New-Object System.Collections.Generic.List[double]} }
+    if($x.early -isnot [DBNull]){ $stAcc[$nm2].e.Add([double]$x.early) }
+    $stAcc[$nm2].m.Add([double]$x.posavg/[double]$x.ptou) }
+  foreach($nm2 in $stAcc.Keys){ $sacc=$stAcc[$nm2]; if($sacc.m.Count -lt 1){ continue }
+    $me2= if($sacc.e.Count -ge 1){ ($sacc.e|Measure-Object -Average).Average }else{ 99 }
+    $mr = ($sacc.m|Measure-Object -Average).Average
+    $styleOf[$nm2]= if($me2 -le 1.5){'逃げ'}elseif($mr -le 0.33){'先行'}elseif($mr -le 0.66){'差し'}else{'追込'} }
+}catch{}
+
 # 軸確度ラダー(g12/range16/idx1)+波乱度(テク6)[[jra-chihou-signal-verify]]
 if($idxByRk.ContainsKey(1) -and $idxByRk.ContainsKey(2)){
   $g12=$idxByRk[1]-$idxByRk[2]; $r16= if($idxByRk.ContainsKey(6)){$idxByRk[1]-$idxByRk[6]}else{$null}
@@ -92,16 +119,25 @@ $tsurf=''; $tdist=0; if($tc.Rows.Count){ $tsurf=[string]$tc.Rows[0].surf; if($tc
 $useCond = ($tsurf -ne '' -and $tdist -gt 0)
 $dminC=([datetime]$date).AddDays(-365).ToString('yyyy-MM-dd')
 $fieldSet=@{}; $field|ForEach-Object{$fieldSet[$_]=$true}
-$recentKeys=@{}; $allKeys=@{}
-foreach($h in $field){
-  $rk= if($useCond){
-    Q1 "SELECT TOP 6 k.開催場所,k.開催日,k.レース番号 FROM dbo.競走結果 k JOIN dbo.レース情報 ri ON ri.開催場所=k.開催場所 AND ri.開催日=k.開催日 AND ri.レース番号=k.レース番号 AND ri.馬名=k.馬名 WHERE k.馬名=@h AND k.開催日<@d AND k.開催日>=@m AND k.走破時計>0 AND ri.コース種別=@surf AND ABS(TRY_CAST(ri.距離 AS int)-@dist)<=200 ORDER BY k.開催日 DESC,k.レース番号 DESC" @{'@h'=$h;'@d'=$date;'@m'=$dminC;'@surf'=$tsurf;'@dist'=$tdist}
-  }else{
-    Q1 "SELECT TOP ($RecentN) 開催場所,開催日,レース番号 FROM dbo.競走結果 WHERE 馬名=@h AND 開催日<@d AND 開催日>=@m AND 走破時計>0 ORDER BY 開催日 DESC,レース番号 DESC" @{'@h'=$h;'@d'=$date;'@m'=$dminC} }
-  $keys=@(); foreach($x in $rk.Rows){ $kk=[string]$x.開催場所+'|'+([datetime]$x.開催日).ToString('yyyy-MM-dd')+'|'+[string]([int]$x.レース番号); $keys+=$kk; if(-not $allKeys.ContainsKey($kk)){$allKeys[$kk]=@{v=[string]$x.開催場所;d=([datetime]$x.開催日).ToString('yyyy-MM-dd');r=[int]$x.レース番号}} }
-  $recentKeys[$h]=$keys
+$recentKeys=@{}; $raceRows=@{}
+# h2h近走: 全頭一括(馬名IN+ROW_NUMBER)で近走キー→対象レース全馬の走破時計を各1クエリで取得(逐次N+M回→2回)[[jra 高速化]]。出力h2h順位は逐次版と同一。
+if($field.Count -gt 0){
+  $inp=@(); $php=@{'@d'=$date;'@m'=$dminC}; for($i=0;$i -lt $field.Count;$i++){ $inp+=('@ph'+$i); $php['@ph'+$i]=$field[$i] }
+  $inList=$inp -join ','
+  if($useCond){ $php['@surf']=$tsurf; $php['@dist']=$tdist
+    $recentBody="SELECT k.馬名, k.開催場所 v, k.開催日 d, k.レース番号 r, ROW_NUMBER() OVER(PARTITION BY k.馬名 ORDER BY k.開催日 DESC,k.レース番号 DESC) rn FROM dbo.競走結果 k JOIN dbo.レース情報 ri ON ri.開催場所=k.開催場所 AND ri.開催日=k.開催日 AND ri.レース番号=k.レース番号 AND ri.馬名=k.馬名 WHERE k.馬名 IN ($inList) AND k.開催日<@d AND k.開催日>=@m AND k.走破時計>0 AND ri.コース種別=@surf AND ABS(TRY_CAST(ri.距離 AS int)-@dist)<=200"
+    $rnCap=6
+  } else {
+    $recentBody="SELECT 馬名, 開催場所 v, 開催日 d, レース番号 r, ROW_NUMBER() OVER(PARTITION BY 馬名 ORDER BY 開催日 DESC,レース番号 DESC) rn FROM dbo.競走結果 WHERE 馬名 IN ($inList) AND 開催日<@d AND 開催日>=@m AND 走破時計>0"
+    $rnCap=$RecentN
+  }
+  foreach($x in (Q1 "WITH rr AS ($recentBody) SELECT 馬名,v,d,r FROM rr WHERE rn<=$rnCap" $php).Rows){
+    $h=[string]$x.馬名; $kk=[string]$x.v+'|'+([datetime]$x.d).ToString('yyyy-MM-dd')+'|'+[string]([int]$x.r)
+    if(-not $recentKeys.ContainsKey($h)){$recentKeys[$h]=@()}; $recentKeys[$h]+=$kk }
+  foreach($row in (Q1 "WITH rr AS ($recentBody), races AS (SELECT DISTINCT v,d,r FROM rr WHERE rn<=$rnCap) SELECT k.開催場所 v,k.開催日 d,k.レース番号 r,k.馬名,k.走破時計 t FROM dbo.競走結果 k JOIN races ON races.v=k.開催場所 AND races.d=k.開催日 AND races.r=k.レース番号 WHERE k.走破時計>0 AND k.着順>0" $php).Rows){
+    $kk=[string]$row.v+'|'+([datetime]$row.d).ToString('yyyy-MM-dd')+'|'+[string]([int]$row.r)
+    if(-not $raceRows.ContainsKey($kk)){$raceRows[$kk]=@{}}; $raceRows[$kk][[string]$row.馬名]=[double]$row.t }
 }
-$raceRows=@{}; foreach($kk in $allKeys.Keys){ $info=$allKeys[$kk]; $m2=@{}; foreach($row in (Q1 "SELECT 馬名,走破時計 FROM dbo.競走結果 WHERE 開催場所=@v AND 開催日=@d AND レース番号=@r AND 走破時計>0 AND 着順>0" @{'@v'=$info.v;'@d'=$info.d;'@r'=$info.r}).Rows){ $m2[[string]$row.馬名]=[double]$row.走破時計 }; $raceRows[$kk]=$m2 }
 $raceWin=@{}; foreach($kk in $raceRows.Keys){ $vals=@($raceRows[$kk].Values); if($vals.Count){ $raceWin[$kk]=($vals|Measure-Object -Minimum).Minimum } }
 $mavg=@{}
 foreach($a in $field){ $mavg[$a]=@{}; $tmp=@{}
@@ -114,8 +150,19 @@ function PairM2($a,$b){ $vv=@(); if($mavg[$a].ContainsKey($b)){$vv+=$mavg[$a][$b
 $h2hScore=@{}; foreach($a in $field){ $ms=@(); foreach($b in $field){ if($a -ne $b){ $mm=PairM2 $a $b; if($null -ne $mm){$ms+=$mm} } }; if($ms.Count -ge 1){$h2hScore[$a]=($ms|Measure-Object -Average).Average} }
 $h2hRkNm=@{}; $hi=1; foreach($kv in ($h2hScore.GetEnumerator()|Sort-Object Value -Descending)){ $h2hRkNm[$kv.Key]=$hi; $hi++ }
 function H2hLabel($nm){ $hr= if($h2hRkNm.ContainsKey($nm)){$h2hRkNm[$nm]}else{0}; if($hr -le 0){return ''}; $cr= if($compiRk.ContainsKey($nm)){$compiRk[$nm]}else{99}
-  $tag= if($cr -eq 1 -and $hr -eq 1){'両1位'}elseif($cr -eq 1 -and $hr -ge 6){'h2h不支持'}elseif($hr -ge 1 -and $hr -le 2 -and $cr -ge 4){'地力先行'}else{''}
+  $tag= if($cr -eq 1 -and $hr -eq 1){'両1位'}elseif($cr -eq 1 -and $hr -ge 6){'h2h不支持'}elseif($hr -ge 1 -and $hr -le 2 -and $cr -ge 4 -and $cr -le 7){'h2h実力馬'}else{''}   # ★'地力先行'→'h2h実力馬'に改称+コンピ帯限定(2026-07-12ユーザー・BT検証): h2h1-2位×市場低評価だが実力上位。コンピ4-7位のみ複勝率26-35%(field平均超・4年頑健)=馬券圏で付与。コンピ8位以下は馬券にならない(8-9=16%/10+=消し)ため非付与
   ('h2h{0}位{1}' -f $hr,$(if($tag){'('+$tag+')'}else{''})) }
+
+# 8) 投票済み馬券(IPAT実投票=IPAT投票履歴・結果'投票完了')。本線の下に表示。
+$voted=@()
+foreach($x in (Q1 "SELECT 式別,方式,軸馬番,相手馬番,組番,点数,一点金額,投票金額,結果,ISNULL(払戻金額,0) pay,取得元 FROM dbo.IPAT投票履歴 WHERE 開催日=@d AND 開催場所=@v AND レース番号=@r AND 結果=N'投票完了' ORDER BY 投票日時" @{'@d'=$date;'@v'=$Venue;'@r'=$Race}).Rows){
+  $pv=[int]("0"+"$($x.pay)")
+  $voted += [ordered]@{
+    bt="$($x.式別)"; method="$($x.方式)".Trim(); axis="$($x.軸馬番)".Trim(); aite="$($x.相手馬番)".Trim(); kumi="$($x.組番)".Trim()
+    pts=[int]("0"+"$($x.点数)"); unit=[int]("0"+"$($x.一点金額)"); amt=[int]("0"+"$($x.投票金額)")
+    res="$($x.結果)"; pay=$pv; hit=[bool]($pv -gt 0); src="$($x.取得元)"
+  }
+}
 $cn.Close()
 
 # 今走騎手・勝負気配
@@ -149,10 +196,15 @@ foreach($r in $hd.Rows){
     tan=$(if($o){$o.tan}else{0}); fmin=$(if($o){$o.fmin}else{0}); fmax=$(if($o){$o.fmax}else{0}); pop=$(if($o){$o.pop}else{0})
     chaku=$(if($chOf.ContainsKey($u)){$chOf[$u]}else{0}); tanPay=$(if($tanConf.ContainsKey($u)){$tanConf[$u]}else{0}); fukuPay=$(if($fukuConf.ContainsKey($u)){$fukuConf[$u]}else{0})
     qual=$(if($qual.ContainsKey($u)){($qual[$u] -join ' ／ ')}else{''})
+    style=$(if($styleOf.ContainsKey($nm)){$styleOf[$nm]}else{''})
     keshi=''
     frame=$(if($r.枠番 -isnot [DBNull] -and [int]("0"+"$($r.枠番)") -gt 0){[int]("0"+"$($r.枠番)")}elseif($r.frame2 -isnot [DBNull] -and [int]("0"+"$($r.frame2)") -gt 0){[int]("0"+"$($r.frame2)")}else{0})
     scratched=$(if($scratched.ContainsKey($u)){$true}else{$false})
   }
 }
 $horses=@($horses | Sort-Object {[int]$_.rk},{[int]$_.uma})
-[ordered]@{ date=$date; venue=$Venue; race=$Race; post=$post; dist=$dist; raceName=$rn2; finished=$finished; cancelled=$cancelled; meta=$meta; horses=$horses } | ConvertTo-Json -Depth 6 -Compress
+# 枠番導出: DB枠番が0/未確定(発走前など)なら馬番+頭数からJRA標準規則で枠を算出(枠色表示用)。
+$NT=$horses.Count
+if($NT -gt 0){ foreach($h in $horses){ if([int]$h.frame -le 0){ $u=[int]$h.uma
+  if($NT -le 8){ $h.frame=$u } else { $q=[math]::Floor($NT/8); $rr=$NT%8; $base=(8-$rr)*$q; $h.frame= if($u -le $base){[int][math]::Ceiling($u/[double]$q)}else{(8-$rr)+[int][math]::Ceiling(($u-$base)/[double]($q+1))} } } } }
+[ordered]@{ date=$date; venue=$Venue; race=$Race; post=$post; dist=$dist; raceName=$rn2; finished=$finished; cancelled=$cancelled; meta=$meta; horses=$horses; voted=$voted } | ConvertTo-Json -Depth 6 -Compress

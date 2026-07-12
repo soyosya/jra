@@ -135,6 +135,24 @@ app.MapGet("/api/buyme", (string? venue, int race, string? date) =>
         return Results.Content(RunPs("buyme.ps1", "-Venue", venue, "-Race", race.ToString(), "-Date", date), "application/json; charset=utf-8");
     return Results.Content(RunPs("buyme.ps1", "-Venue", venue, "-Race", race.ToString()), "application/json; charset=utf-8");
 });
+// ★買目選定理由(地方から移植)。買目全頭データ + jra-card評価/総合(バックグラウンドで温めた場単位キャッシュ) + 予想突合。
+app.MapGet("/reason", () => Results.Content(ReasonHtml(), "text/html; charset=utf-8"));
+app.MapGet("/api/reason", (string? venue, int race, string? date) =>
+{
+    if (string.IsNullOrWhiteSpace(venue) || race <= 0) return Results.Content("{\"error\":\"venue/race必須\"}", "application/json; charset=utf-8");
+    if (venue.Length > 12) venue = venue.Substring(0, 12);
+    if (!string.IsNullOrEmpty(date) && System.Text.RegularExpressions.Regex.IsMatch(date, @"^\d{4}-\d{2}-\d{2}$"))
+        return Results.Content(RunPs("reason.ps1", "-Venue", venue, "-Race", race.ToString(), "-Date", date), "application/json; charset=utf-8");
+    return Results.Content(RunPs("reason.ps1", "-Venue", venue, "-Race", race.ToString()), "application/json; charset=utf-8");
+});
+// ★日次総括+深掘り一覧(1レースずつ深掘りした振り返りの索引)。keiba-daily-retro-granularity 絶対ルールの締め。
+app.MapGet("/retro", () => Results.Content(RetroHtml(), "text/html; charset=utf-8"));
+app.MapGet("/api/retro", (string? date) =>
+{
+    if (!string.IsNullOrEmpty(date) && System.Text.RegularExpressions.Regex.IsMatch(date, @"^\d{4}-\d{2}-\d{2}$"))
+        return Results.Content(RunPs("retro.ps1", "-Date", date), "application/json; charset=utf-8");
+    return Results.Content(RunPs("retro.ps1"), "application/json; charset=utf-8");
+});
 // 買目ページからの投票。DryRun=試算同期/ConfirmStop・Auto=デタッチ起動。vote.ps1がIpatVote稼働中ガード等を実施。実金はIPAT実DOM較正後。
 app.MapPost("/api/vote", async (HttpContext ctx) =>
 {
@@ -212,6 +230,20 @@ app.MapPost("/api/race-toggle", async (HttpContext ctx) =>
     File.WriteAllText(file, JsonSerializer.Serialize(new Dictionary<string, object> { ["date"] = today, ["disabled"] = disabled.Distinct().ToList() }), new UTF8Encoding(false));
     return Results.Content(JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = true, ["venue"] = venue, ["race"] = race, ["autovote"] = enabled }), "application/json; charset=utf-8");
 });
+// ★自動投票 一括ON/OFF(地方移植)。body={enabled,keys[]}。enabled=true→disabled空(全部する)、false→keys(venue|race)をdisabled(全部しない)。当日分race-autovote.json上書き。
+app.MapPost("/api/race-toggle-all", async (HttpContext ctx) =>
+{
+    string body = await new StreamReader(ctx.Request.Body).ReadToEndAsync();
+    JsonElement d; try { d = JsonDocument.Parse(body).RootElement; } catch { return Results.BadRequest("JSON不正"); }
+    bool enabled = !d.TryGetProperty("enabled", out var en) || en.ValueKind != JsonValueKind.False;
+    var disabled = new List<string>();
+    if (!enabled && d.TryGetProperty("keys", out var ks) && ks.ValueKind == JsonValueKind.Array)
+        foreach (var x in ks.EnumerateArray()) { var s = x.GetString(); if (!string.IsNullOrWhiteSpace(s) && s!.Length <= 20) disabled.Add(s!); }
+    string today2 = DateTime.Today.ToString("yyyy-MM-dd");
+    string file2 = @"C:\jra\RunnerControl\race-autovote.json";
+    File.WriteAllText(file2, JsonSerializer.Serialize(new Dictionary<string, object> { ["date"] = today2, ["disabled"] = disabled.Distinct().ToList() }), new UTF8Encoding(false));
+    return Results.Content(JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = true, ["enabled"] = enabled, ["count"] = disabled.Count }), "application/json; charset=utf-8");
+});
 // 取りやめ(レース中止)トグル(A9)。当日cancelledリストを race-cancel.json に書込(表示/投票ブロック/ランナースキップが参照)。
 app.MapPost("/api/race-cancel", async (HttpContext ctx) =>
 {
@@ -231,6 +263,36 @@ app.MapPost("/api/race-cancel", async (HttpContext ctx) =>
     return Results.Content(JsonSerializer.Serialize(new Dictionary<string, object> { ["ok"] = true, ["venue"] = venue, ["race"] = race, ["cancelled"] = cancelled }), "application/json; charset=utf-8");
 });
 app.MapGet("/api/status", () => Results.Content(RunPs("status.ps1"), "application/json; charset=utf-8"));
+// ★全体収支「更新」ボタン。IPAT投票履歴を当日結果と突合して確定/払戻を最新化(jra-ipat-settle)。DBのみ・高速。
+app.MapPost("/api/ipat-settle", () => Results.Content(RunPs("ipat-settle.ps1"), "application/json; charset=utf-8"));
+// ★IPAT投票可能額(残高) 表示(地方rakuten-balance移植)。更新ボタン=IpatVote balanceをバックグラウンド照会/状態ポーリング/初期は直近値。
+app.MapPost("/api/ipat-balance-refresh", () => Results.Content(RunPs("ipat-balance-launch.ps1"), "application/json; charset=utf-8"));
+app.MapGet("/api/ipat-balance-status", () =>
+{
+    try { var f = @"C:\jra\RunnerControl\ipat-balance-status.json"; if (File.Exists(f)) return Results.Content(File.ReadAllText(f, Encoding.UTF8), "application/json; charset=utf-8"); }
+    catch { }
+    return Results.Content("{\"state\":\"idle\",\"done\":true}", "application/json; charset=utf-8");
+});
+// 最後に照会したIPAT残高(ipat-balance.txt=時刻\t金額)を返す。投票画面の初期表示用(照会は走らせない)。
+app.MapGet("/api/ipat-balance", () =>
+{
+    try
+    {
+        var bf = @"C:\jra\RunnerControl\ipat-balance.txt";
+        if (File.Exists(bf))
+        {
+            var parts = File.ReadAllText(bf, Encoding.UTF8).Trim().Split('\t');
+            if (parts.Length >= 2 && long.TryParse(parts[1].Trim(), out var amt))
+            {
+                var t = "";
+                if (DateTime.TryParse(parts[0].Trim(), out var dt)) t = dt.ToString("HH:mm");
+                return Results.Content("{\"balance\":" + amt + ",\"balT\":\"" + t + "\"}", "application/json; charset=utf-8");
+            }
+        }
+    }
+    catch { }
+    return Results.Content("{\"balance\":null}", "application/json; charset=utf-8");
+});
 app.MapGet("/api/params", () => Results.Content(RunPs("get-params.ps1"), "application/json; charset=utf-8"));
 app.MapGet("/api/log", () =>
 {
@@ -413,6 +475,30 @@ app.MapPost("/api/config/presets/delete", async (HttpContext ctx) =>
         try { File.WriteAllText(cfgPresetsPath, arr.ToJsonString(new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping })); }
         catch (Exception ex) { return Results.Content("NG: 削除失敗 " + ex.Message, "text/plain; charset=utf-8"); }
         return Results.Content("OK: プリセット「" + name + "」を削除しました", "text/plain; charset=utf-8");
+    }
+});
+
+// ★自動精算ループ: 日中(9-19時)2分毎に当日IPAT投票履歴を結果(払戻金)と突合して確定/払戻を最新化。
+// 地方の Keiba_SettleNow_2min 相当。DB突合のみ・冪等・金銭移動なし。結果が取り込まれ次第、全体収支が自動更新される。
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        try { var h = DateTime.Now.Hour; if (h >= 9 && h < 19) RunPs("ipat-settle.ps1"); }
+        catch { /* 個別失敗は無視して継続 */ }
+        await Task.Delay(TimeSpan.FromSeconds(120));
+    }
+});
+
+// ★選定理由の評価キャッシュ・ウォーマー: 日中(9-18時)、当日各開催場のjra-card評価/総合を1回1場ずつ温める。
+// reason.ps1 はこのキャッシュを読むだけ(157秒級のjra-cardをWebリクエスト同期で回さない)。1場ごとに約150秒→待機180秒。
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        try { var h = DateTime.Now.Hour; if (h >= 9 && h < 19) RunPs("reason-warm.ps1"); }
+        catch { /* 個別失敗は無視して継続 */ }
+        await Task.Delay(TimeSpan.FromSeconds(180));
     }
 });
 
@@ -943,14 +1029,15 @@ pre{background:#0a0d11;border-radius:8px;padding:10px;overflow:auto;max-height:3
 .warn{background:#3a3120;color:#ffd479;padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:10px}
 </style></head><body><div class="wrap">
 <h1 style="display:flex;align-items:center;gap:10px"><img src="/icon-32.png" width="30" height="30" style="border-radius:7px" alt="Turfora">中央競馬(JRA) 自動投票 コントロール</h1>
-<div style="margin:-4px 0 10px"><a href="/history" style="color:#7aa2ff;text-decoration:none;font-size:14px">📋 投票履歴を見る →</a>　<a href="/ledger" style="color:#7aa2ff;text-decoration:none;font-size:14px">📒 台帳を見る →</a>　<a href="/races" style="color:#7aa2ff;text-decoration:none;font-size:14px">🐎 買目・投票 →</a>　<a href="/win5" style="color:#7aa2ff;text-decoration:none;font-size:14px">🎯 WIN5点数 →</a>　<a href="/config" style="color:#7aa2ff;text-decoration:none;font-size:14px">🛠 設定ファイル →</a>　<a href="/profiles" style="color:#7aa2ff;text-decoration:none;font-size:14px">📋 プロファイル →</a></div>
+<div style="margin:-4px 0 10px"><a href="/history" style="color:#7aa2ff;text-decoration:none;font-size:14px">📋 投票履歴を見る →</a>　<a href="/ledger" style="color:#7aa2ff;text-decoration:none;font-size:14px">📒 台帳を見る →</a>　<a href="/retro" style="color:#7aa2ff;text-decoration:none;font-size:14px">📒 日次総括・深掘り →</a>　<a href="/races" style="color:#7aa2ff;text-decoration:none;font-size:14px">🐎 買目・投票 →</a>　<a href="/win5" style="color:#7aa2ff;text-decoration:none;font-size:14px">🎯 WIN5点数 →</a>　<a href="/config" style="color:#7aa2ff;text-decoration:none;font-size:14px">🛠 設定ファイル →</a>　<a href="/profiles" style="color:#7aa2ff;text-decoration:none;font-size:14px">📋 プロファイル →</a></div>
 <div class="warn">Mode「通知のみ」=買目作成＋通知のみで<b>実投票しません</b>。DryRun/ConfirmStop/Autoで実投票が有効化されます(Auto=無人で実金が動く)。IPAT実DOM較正前は通知のみで運用してください。</div>
 
 <div class="card">
   <div class="row"><span class="k">ランナー</span><span class="v big" id="st-runner">…</span></div>
   <div class="row"><span class="k">確定収支(本日・自動)</span><span class="v" id="st-pl">…</span></div>
   <div class="row"><span class="k">手動投票(本日)</span><span class="v" id="st-mpl">…</span></div>
-  <div class="row"><span class="k">全体収支(本日・自動+手動)</span><span class="v" id="st-apl">…</span></div>
+  <div class="row"><span class="k">全体収支(本日・自動+手動) <a href="#" onclick="refreshIpatPl(event)" style="font-size:12px;color:#7aa2ff;text-decoration:none;font-weight:600" title="IPAT投票履歴を当日の結果と突合して収支を最新化">🔄更新</a></span><span class="v" id="st-apl">…</span></div>
+  <div class="row"><span class="k">投票可能額(残高) <a href="#" onclick="refreshHomeBal(event)" style="font-size:12px;color:#7aa2ff;text-decoration:none;font-weight:600" title="IPATにログインして残高を照会・最新化">🔄更新</a></span><span class="v" id="st-bal">…</span></div>
   <div class="row"><span class="k">現在の設定</span><span class="v" id="st-mode">…</span></div>
   <div class="row"><span class="k">タスク</span><span class="v" id="st-task">…</span></div>
   <div class="row"><span class="k">最終起動</span><span class="v" id="st-last">…</span></div>
@@ -1042,6 +1129,37 @@ async function loadStatus(){
   window.__nextVenue = s.nextVenue || '';
   document.getElementById('st-now').textContent = s.now;
 }
+// 全体収支「更新」: IPAT投票履歴を当日結果と突合(精算)→状態を再読込して収支を最新化。
+async function refreshIpatPl(ev){ if(ev){ev.preventDefault();ev.stopPropagation();}
+  var a=(ev&&ev.target&&ev.target.tagName==='A')?ev.target:null; if(a){a.textContent='更新中…';a.style.pointerEvents='none';}
+  try{ var r=await fetch('/api/ipat-settle',{method:'POST'}); var j=await r.json();
+    await loadStatus();
+    if(j&&j.ok===false){ alert('更新失敗: '+(j.message||'')); }
+    else if(a){ a.textContent='🔄更新'+((j&&j.settled>0)?'（'+j.settled+'件精算）':''); }
+  }catch(e){ alert('更新に失敗しました'); }
+  finally{ if(a){a.style.pointerEvents=''; setTimeout(function(){ a.textContent='🔄更新'; },4000);} }
+  return false;
+}
+// 投票可能額(残高)。初期/tick=直近値(照会せず)、更新ボタン=IpatVote balance照会→ポーリング。買目画面と同じAPI。
+async function loadHomeBal(){
+  try{ var j=await (await fetch('/api/ipat-balance')).json(); var el=document.getElementById('st-bal'); if(!el)return;
+    if(('' +el.textContent).indexOf('照会中')>=0)return;   // 照会中は上書きしない
+    if(j&&j.balance!=null){ el.textContent=Number(j.balance).toLocaleString()+'円'+(j.balT?'（'+j.balT+'）':''); el.className='v'; el.style.color='#e6e9ef'; }
+    else { el.textContent='未取得'; el.style.color='#8a93a3'; } }catch(e){}
+}
+async function refreshHomeBal(ev){ if(ev){ev.preventDefault();ev.stopPropagation();}
+  var el=document.getElementById('st-bal'), a=(ev&&ev.target&&ev.target.tagName==='A')?ev.target:null;
+  if(el){el.textContent='照会中…（IPATログイン）';el.style.color='#e6e9ef';} if(a){a.style.pointerEvents='none';}
+  try{ await fetch('/api/ipat-balance-refresh',{method:'POST'}); }catch(e){}
+  var tries=0; var timer=setInterval(async function(){ tries++;
+    try{ var s=await (await fetch('/api/ipat-balance-status')).json();
+      if(s&&s.done){ clearInterval(timer); if(a){a.style.pointerEvents='';}
+        if(s.balance!=null){ el.textContent=Number(s.balance).toLocaleString()+'円'; el.style.color='#7ee787'; }
+        else { el.textContent=(s.message||'未取得'); el.style.color='#ffb454'; el.title=s.message||''; } } }catch(e){}
+    if(tries>45){ clearInterval(timer); if(a){a.style.pointerEvents='';} if((''+el.textContent).indexOf('照会中')>=0){ el.textContent='タイムアウト'; el.style.color='#ff8a8a'; } }
+  },2000);
+  return false;
+}
 function applyToForm(p){
   document.getElementById('p-mode').value=p.mode;
   document.getElementById('p-bet').value=p.betType;
@@ -1112,7 +1230,7 @@ async function loadLog(){
   el.textContent=t;
   if(atBottom){ el.scrollTop = el.scrollHeight; } // 最下部にいた時だけ最新へ追従(過去ログ閲覧中は追従しない)
 }
-function tick(){ loadStatus(); loadLog(); }
+function tick(){ loadStatus(); loadLog(); loadHomeBal(); }
 loadParams(); loadPresets(); tick(); setInterval(tick,5000);
 </script>
 </div></body></html>
@@ -1349,7 +1467,12 @@ tr.rc:hover td{background:#161b22}
   <select id="f-state" onchange="render()"><option value="">状態(全)</option><option value="fin">確定済</option><option value="pre">未確定</option><option value="voted">投票済</option></select>
   <button onclick="clearF()">クリア</button>
 </div>
-<div class="note">列見出し（発走/開催/確度/状態）クリックで昇順・降順ソート。行クリックで出馬表（馬柱）へ。</div>
+<div class="note">初期並びは現在時刻で自動（前半＝発走昇順▲／後半＝降順▼・本日発走の中央値で判定）。列見出し（発走/開催/確度/状態）クリックで昇順・降順ソート。行クリックで出馬表（馬柱）へ。「自動投票 一括」は未確定・未発走の全レースをまとめて切替。</div>
+<div style="margin:6px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+  <span style="font-size:12px;color:#8a93a3">自動投票 一括:</span>
+  <button onclick="toggleAll(true)" title="未確定の全レースを自動投票「する」に" style="background:#16331f;color:#7ee0a0;border:1px solid #2f5a3a;border-radius:6px;padding:4px 11px;cursor:pointer;font-weight:600">🟢 全部する</button>
+  <button onclick="toggleAll(false)" title="未確定の全レースを自動投票「しない」に" style="background:#331616;color:#ff9b9b;border:1px solid #5a2f37;border-radius:6px;padding:4px 11px;cursor:pointer;font-weight:600">🔴 全部しない</button>
+</div>
 <table><thead><tr><th id="h-post" onclick="sortBy('post')" style="cursor:pointer">発走</th><th id="h-venue" onclick="sortBy('venue')" style="cursor:pointer">開催</th><th>軸(◎)</th><th id="h-conf" onclick="sortBy('conf')" style="cursor:pointer">確度</th><th>式別</th><th id="h-state" onclick="sortBy('state')" style="cursor:pointer">状態</th><th>自動投票</th></tr></thead><tbody id="tb"></tbody></table>
 <div class="note" id="cnt"></div>
 <script>
@@ -1361,7 +1484,7 @@ function confRank(c){return c==='鉄板'?0:(c==='標準'?1:(c==='警戒'?2:3));}
 function uniq(a){return a.filter(function(v,i){return v!=null&&v!==''&&a.indexOf(v)===i;});}
 function fillSel(id,vals,label){document.getElementById(id).innerHTML='<option value="">'+label+'</option>'+vals.map(function(v){return '<option>'+esc(v)+'</option>';}).join('');}
 function rowHtml(r){
-  var u='/shutuba?venue='+encodeURIComponent(r.venue)+'&race='+r.race;
+  var u='/buyme?venue='+encodeURIComponent(r.venue)+'&race='+r.race;
   var canceled=(r.cancelled===true);
   var st=[];
   if(canceled){ st.push('<span style="color:#ff6b6b;font-weight:700">🚫取りやめ</span>'); }
@@ -1389,6 +1512,16 @@ async function toggleAV(ev,venue,race,enable){
     if(res&&res.ok){ for(var i=0;i<ALL.length;i++){ if(ALL[i].venue===venue&&(''+ALL[i].race)===(''+race)){ ALL[i].autovote=res.autovote; break; } } render(); }
     else alert('切替に失敗しました'); }catch(e){ alert('通信に失敗しました'); }
 }
+// 自動投票 一括する/しない(地方移植): 未確定・未発走(=変更が意味を持つ)レースをまとめて切替。取りやめ・終了レースは対象外。
+async function toggleAll(enable){
+  var elig=(ALL||[]).filter(function(r){ return !isOver(r) && !r.cancelled; });
+  if(elig.length===0){ alert('対象(未確定・未発走)のレースがありません'); return; }
+  if(!confirm('未確定・未発走の '+elig.length+' レースを 自動投票「'+(enable?'する':'しない')+'」 に一括設定しますか？')) return;
+  var keys=enable?[]:elig.map(function(r){ return r.venue+'|'+r.race; });
+  try{ var res=await (await fetch('/api/race-toggle-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enable,keys:keys})})).json();
+    if(res&&res.ok){ for(var i=0;i<ALL.length;i++){ if(!isOver(ALL[i]) && !ALL[i].cancelled){ ALL[i].autovote=enable; } } render(); }
+    else alert('一括切替に失敗しました'); }catch(e){ alert('通信に失敗しました'); }
+}
 async function toggleCancel(ev,venue,race,cancel){
   ev.stopPropagation();
   if(cancel && !confirm(venue+race+'R を取りやめ(中止)にしますか？\n表示が「🚫取りやめ」になり、自動投票・手動投票ともできなくなります。')) return;
@@ -1403,6 +1536,8 @@ function sortBy(k){ if(sortKey===k){sortDir=-sortDir;}else{sortKey=k;sortDir=1;}
 function hdrMark(k){ return sortKey===k?(sortDir>0?' ▲':' ▼'):''; }
 var NEXTKEY=null;
 function parsePostMin(s){ var m=/^(\d{1,2}):(\d{2})$/.exec(String(s||'')); return m?(parseInt(m[1],10)*60+parseInt(m[2],10)):null; }
+// 初期並び方向: 現在時刻が本日全レースの発走中央値より前=前半(昇順1)、以降=後半(降順-1)。データ(ALL)から算出。
+function defaultDir(){ var a=(ALL||[]).map(function(r){return parsePostMin(r.post);}).filter(function(x){return x!=null;}).sort(function(x,y){return x-y;}); if(!a.length)return 1; var mid=a[Math.floor(a.length/2)]; var d=new Date(); return (d.getHours()*60+d.getMinutes())>=mid?-1:1; }
 function computeNextKey(){ var d=new Date(); var nowMin=d.getHours()*60+d.getMinutes(); var best=null,bm=1e9; (ALL||[]).forEach(function(r){ if(r.finished||r.cancelled)return; var p=parsePostMin(r.post); if(p==null)return; if(p>nowMin-3 && p<bm){bm=p;best=r.venue+'|'+r.race;} }); return best; }
 function isOver(r){ if(r.finished)return true; var p=parsePostMin(r.post); if(p==null)return false; var d=new Date(); return p<=(d.getHours()*60+d.getMinutes()); }
 function render(){
@@ -1420,18 +1555,170 @@ function render(){
   document.getElementById('h-conf').textContent='確度'+hdrMark('conf');
   document.getElementById('h-state').textContent='状態'+hdrMark('state');
 }
-function clearF(){['f-venue','f-conf','f-kind','f-state'].forEach(function(id){document.getElementById(id).value='';});sortKey='post';sortDir=1;render();}
+function clearF(){['f-venue','f-conf','f-kind','f-state'].forEach(function(id){document.getElementById(id).value='';});sortKey='post';sortDir=defaultDir();render();}
 var _first=true;
 async function load(){
   var j; try{ j=await (await fetch('/api/races')).json(); }catch(e){ document.getElementById('hd').textContent='読込失敗'; return; }
   ALL=j.races||[];
   document.getElementById('hd').textContent=esc(j.date)+' / '+j.count+'レース'+(j.hasCache?'（買目あり・行クリックで詳細）':'（買目CSV未生成＝ランナー起動で作成）');
-  if(_first){ fillSel('f-venue',uniq(ALL.map(function(r){return r.venue;})).sort(),'場(全)'); _first=false; }
+  if(_first){ fillSel('f-venue',uniq(ALL.map(function(r){return r.venue;})).sort(),'場(全)'); sortDir=defaultDir(); _first=false; }
   render();
 }
 function refMs(){ var m=(location.search.match(/[?&]refresh=(\d+)/)||[])[1]; var s=(m==null?5:parseInt(m,10)); return (isNaN(s)||s<=0)?0:s*1000; }
 load();
 (function(){ var ms=refMs(); var n=document.getElementById('refnote'); if(ms){ if(n)n.textContent='🔄 '+(ms/1000)+'秒ごとに自動更新（?refresh=秒数 で変更・0で停止）'; setInterval(load,ms); } else if(n){ n.textContent='自動更新オフ（?refresh=5 で有効化）'; } })();
+</script>
+</div></body></html>
+""";
+
+// ★日次総括+深掘り一覧(JRA)。その日の _総括.md と 各レース深掘りへのリンクを表示。日付切替つき。
+string RetroHtml() => """
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<title>日次総括・深掘り一覧(JRA)</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b0e13;color:#e6e9ef;font-family:system-ui,'Segoe UI',sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:14px}
+h1{font-size:18px;margin:6px 0}h2{font-size:15px;margin:16px 0 6px;color:#ffd479;border-bottom:1px solid #2a313c;padding-bottom:4px}
+a.back{color:#7aa2ff;text-decoration:none;font-size:14px}
+.note{color:#8a93a3;font-size:12px;margin:6px 0}
+.narr{background:#11151c;border:1px solid #2a313c;border-radius:8px;padding:12px 14px;white-space:pre-wrap;font-size:13px;line-height:1.8}
+select{background:#161b22;color:#e6e9ef;border:1px solid #39414d;border-radius:6px;padding:4px 8px;font-size:14px}
+.rlist{display:flex;flex-direction:column;gap:4px;margin:6px 0}
+.rcard{display:block;background:#161b22;border:1px solid #2a313c;border-radius:8px;padding:8px 11px;text-decoration:none;color:#e6e9ef;font-size:13px}
+.rcard:hover{border-color:#5b6472;background:#1b212b}
+.rcard b{color:#7db4ff}
+.rkspin{display:inline-block;width:15px;height:15px;border:2px solid #7aa2ff;border-top-color:transparent;border-radius:50%;animation:rkspinA .8s linear infinite;vertical-align:-2px;margin-right:5px}
+@keyframes rkspinA{to{transform:rotate(360deg)}}
+</style></head><body><div class="wrap">
+<a class="back" href="/">🏠 コントロールに戻る</a>　<a class="back" href="/races">← 今日のレース一覧</a>
+<h1 id="hd"><span class="rkspin"></span>読込中...</h1>
+<div style="margin:6px 0"><label class="note">開催日：</label> <select id="dsel" onchange="location.href='/retro?date='+this.value"></select></div>
+<h2>日次総括</h2>
+<div id="sum" class="narr">（未作成）</div>
+<h2>各レース深掘り（クリックで選定理由・振り返りへ）</h2>
+<div id="rlist" class="rlist"></div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function qp(k){return new URLSearchParams(location.search).get(k)||'';}
+async function load(){
+  var d=qp('date'),dq=d?'?date='+encodeURIComponent(d):'';
+  var j; try{ j=await (await fetch('/api/retro'+dq)).json(); }catch(e){ document.getElementById('hd').textContent='読込失敗'; return; }
+  document.getElementById('hd').textContent='📒 日次総括・深掘り一覧　'+j.date+'（'+(j.count||0)+'レース）';
+  var ds=document.getElementById('dsel'); ds.innerHTML=(j.dates||[]).map(function(x){ return '<option value="'+x+'"'+(x===j.date?' selected':'')+'>'+x+'</option>'; }).join('')||('<option>'+j.date+'</option>');
+  document.getElementById('sum').textContent=j.summary||'（未作成）この日の日次総括はまだありません。';
+  document.getElementById('rlist').innerHTML=(j.races||[]).map(function(r){
+    return '<a class="rcard" href="/reason?venue='+encodeURIComponent(r.venue)+'&race='+r.race+'&date='+encodeURIComponent(j.date)+'"><b>'+esc(r.venue)+' '+r.race+'R</b>　'+esc(r.title)+'</a>';
+  }).join('')||'<div class="note">この日の深掘りはまだありません。</div>';
+}
+load();
+</script>
+</div></body></html>
+""";
+
+// ★買目選定理由(JRA)。買目全頭データ(コンピ/h2h/予測脚質/Δ指数/定性/印/結果)に jra-card評価/総合を重ね、予想突合を表示。
+string ReasonHtml() => """
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="/favicon.ico"><link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<title>選定理由(JRA)</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b0e13;color:#e6e9ef;font-family:system-ui,'Segoe UI',sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:14px}
+h1{font-size:18px;margin:6px 0}h2{font-size:15px;margin:16px 0 6px;color:#ffd479;border-bottom:1px solid #2a313c;padding-bottom:4px}
+a.back{color:#7aa2ff;text-decoration:none;font-size:14px}
+.note{color:#8a93a3;font-size:12px;margin:6px 0}
+.sum{background:#161b22;border:1px solid #2a313c;border-radius:8px;padding:8px 10px;margin:8px 0;font-size:13px;line-height:1.7}
+.badge{display:inline-block;background:#222a35;border:1px solid #39414d;border-radius:6px;padding:1px 8px;margin:1px 3px 1px 0;font-size:12px}
+.badge b{color:#ffd479}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:5px 6px;border-bottom:1px solid #222a35;text-align:left;white-space:nowrap}
+th{color:#8a93a3;font-weight:600}
+td.r,th.r{text-align:right}
+.scroll{overflow-x:auto}
+tr.axisrow td{background:#15130a}
+tr.rank1 td{background:#33290a}tr.rank2 td{background:#23282f}tr.rank3 td{background:#2c2113}
+.chk1,.chk2,.chk3{font-weight:800;padding:1px 7px;border-radius:10px;color:#15130a}
+.chk1{background:#f3c63a}.chk2{background:#c7cdd6}.chk3{background:#d29a55}
+.mk-axis{color:#ffd479;font-weight:700}.mk-rel{color:#7aa2ff;font-weight:700}
+.stg{display:inline-block;min-width:16px;padding:0 3px;border-radius:3px;font-size:10px;font-weight:700;text-align:center;vertical-align:1px}
+.st-nige{background:#5a2222;color:#ff9d9d}.st-senko{background:#54401e;color:#ffce7a}.st-sashi{background:#1e4630;color:#7ee0a5}.st-oikomi{background:#1e3350;color:#8ec2ff}
+.sig-pos{color:#7ee0a5;font-weight:600}.sig-neg{color:#ff8a8a;font-weight:600}.sig-mid{color:#c7cdd6}
+.hit{color:#7ee0a5;font-weight:700}.miss{color:#ff8a8a;font-weight:700}
+.qual{color:#8a93a3;font-size:11px;white-space:normal}
+.narr{background:#11151c;border:1px solid #2a313c;border-radius:8px;padding:12px 14px;white-space:pre-wrap;font-size:13px;line-height:1.8}
+.rkspin{display:inline-block;width:12px;height:12px;border:2px solid #7aa2ff;border-top-color:transparent;border-radius:50%;animation:rkspinA .8s linear infinite;vertical-align:-2px;margin-right:5px}
+@keyframes rkspinA{to{transform:rotate(360deg)}}
+</style></head><body><div class="wrap">
+<a class="back" href="/">🏠 コントロールに戻る</a>　<a id="bbk" class="back" href="#">🎯 買目へ →</a>　<a id="sbk" class="back" href="#">🐎 馬柱へ →</a>　<a class="back" href="/retro">📒 日次総括 →</a>　<a class="back" href="/races">← レース一覧</a>
+<h1 id="hd"><span class="rkspin" style="width:15px;height:15px"></span>読込中...</h1>
+<div id="badges" class="note"></div>
+<h2>各馬評価（jra-card 総合スコア順）</h2>
+<div class="note">総合 = h2h0.4 + V3(調教)0.35 + コンピ0.25 + シグナル補正。シグナル=検証済みの加点/減点ラベル(適/不適/⚡単/前敗/長休/完 等)。着列は確定後に表示。</div>
+<div class="scroll"><table><thead><tr><th>印</th><th class="r">馬</th><th>馬名</th><th class="r">指数</th><th class="r">コ順</th><th class="r">総合</th><th>シグナル(選定/消しの理由)</th><th>脚質</th><th class="r">Δ指数</th><th>h2h</th><th class="r">ベイズ複</th><th class="r">人気</th><th class="r">単勝</th><th class="r">着</th></tr></thead><tbody id="tb"></tbody></table></div>
+<div id="qualbox"></div>
+<div id="result"></div>
+<h2>深掘り振り返り（確定後に1レースずつ深掘り）</h2>
+<div id="narr" class="narr">（未作成）</div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function qp(k){return new URLSearchParams(location.search).get(k)||'';}
+var stMap={'逃げ':['逃','st-nige'],'先行':['先','st-senko'],'差し':['差','st-sashi'],'追込':['追','st-oikomi']};
+function styTag(s){ var m=s&&stMap[s]; return m?('<span class="stg '+m[1]+'">'+m[0]+'</span>'):esc(s||''); }
+function chBadge(c){ return (c>=1&&c<=3)?('<span class="chk'+c+'">'+c+'</span>'):(c>0?esc(c):''); }
+function badge(k,v){ return (v===''||v==null)?'':('<span class="badge">'+esc(k)+' <b>'+esc(v)+'</b></span>'); }
+// シグナル(jra-card評価)を+/-で色分け。消し系=赤/確度加点系=緑。
+function sigHtml(ev){ if(!ev)return '<span class="note" style="margin:0">—</span>';
+  var neg=/危|不適|前敗|長休|相悪|不調|種替|▼|▽/, pos=/適|⚡|完|両1位|地力|注(?!危)/;
+  var cls = neg.test(ev)?'sig-neg':(pos.test(ev)?'sig-pos':'sig-mid');
+  return '<span class="'+cls+'">'+esc(ev)+'</span>'; }
+async function load(){
+  var v=qp('venue'),r=qp('race'),d=qp('date'),dq=d?'&date='+encodeURIComponent(d):'';
+  document.getElementById('bbk').href='/buyme?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+dq;
+  document.getElementById('sbk').href='/shutuba?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+dq;
+  var j; try{ j=await (await fetch('/api/reason?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+dq)).json(); }catch(e){ document.getElementById('hd').textContent='読込失敗'; return; }
+  if(j.error){ document.getElementById('hd').textContent=j.error; return; }
+  var m=j.meta||{};
+  document.getElementById('hd').textContent=j.venue+' '+j.race+'R｜'+(j.dist?j.dist+'m':'')+(j.raceName?' '+j.raceName:'')+'（'+(j.tou||'?')+'頭）'+(j.post?'｜発走'+j.post:'')+'｜'+j.date;
+  var evNote = j.cardSrc==='cache' ? '' : '<span class="badge" style="border-color:#5b4a1e">評価キャッシュ生成待ち（数分後に自動反映）</span>';
+  document.getElementById('badges').innerHTML=
+    badge('軸確度',m.conf)+badge('波乱度',m.seg)+badge('券種',m.kind)
+    +badge('先行予測',(j.senkoCnt>=0?j.senkoCnt+'頭':''))+badge('軸',(j.axis?j.axis+'番'+(j.axisLab?'('+j.axisLab+')':''):''))
+    +badge('相手',j.partners)+evNote;
+  var out=[];
+  (j.horses||[]).forEach(function(h){
+    var cls=(h.chaku>=1&&h.chaku<=3)?('rank'+h.chaku):(h.mark==='◎'?'axisrow':'');
+    out.push('<tr class="'+cls+'"'+(h.scratched?' style="opacity:.5;text-decoration:line-through"':'')+'>'
+      +'<td class="'+(h.mark==='◎'?'mk-axis':'mk-rel')+'">'+esc(h.mark)+'</td>'
+      +'<td class="r"><b>'+h.uma+'</b></td><td>'+esc(h.name)+'</td>'
+      +'<td class="r">'+(h.idx||'')+'</td><td class="r">'+(h.rk||'')+'</td>'
+      +'<td class="r"><b>'+(h.sougou!==''&&h.sougou!=null?(+h.sougou).toFixed(2):'—')+'</b></td>'
+      +'<td>'+sigHtml(h.eval)+'</td>'
+      +'<td>'+styTag(h.style)+'</td>'
+      +'<td class="r">'+(h.dz===''||h.dz==null?'':((+h.dz>=0?'+':'')+h.dz))+'</td>'
+      +'<td>'+esc(h.h2h||'')+'</td>'
+      +'<td class="r">'+(h.pfuku!==''&&h.pfuku!=null?Math.round(h.pfuku*100)+'%':'')+'</td>'
+      +'<td class="r">'+(h.pop>0?h.pop:'')+'</td><td class="r">'+(h.tan>0?(+h.tan).toFixed(1):'')+'</td>'
+      +'<td class="r">'+chBadge(h.chaku)+'</td></tr>');
+  });
+  document.getElementById('tb').innerHTML=out.join('')||'<tr><td colspan="14" class="note">全頭データなし（コンピ/出馬未取得）</td></tr>';
+  // 定性(調教・厩舎)まとめ
+  var qs=(j.horses||[]).filter(function(h){return h.qual;}).map(function(h){ return '<div style="margin:2px 0"><b class="'+(h.mark==='◎'?'mk-axis':'mk-rel')+'">'+esc(h.mark||('#'+h.uma))+'</b> '+esc(h.name)+'：<span class="qual">'+esc(h.qual)+'</span></div>'; });
+  if(qs.length){ document.getElementById('qualbox').innerHTML='<h2>定性メモ（調教・厩舎の話）</h2><div class="sum">'+qs.join('')+'</div>'; }
+  // 結果・予想突合
+  if(j.finished){
+    var t=j.taikou||{};
+    function tk(lbl,o){ if(!o||!o.uma)return ''; var ok=(o.chaku>=1&&o.chaku<=3); return '<span class="badge">'+lbl+' <b>'+o.uma+'番</b>'+(o.lab?'('+esc(o.lab)+')':'')+'→'+(o.chaku>0?o.chaku+'着':'?')+' <span class="'+(ok?'hit':'miss')+'">'+(ok?'複勝圏':'圏外')+'</span></span>'; }
+    var vt=(j.voted||[]).map(function(x){ return '<span class="badge">'+esc(x.bt)+(x.method?esc(x.method):'')+' '+x.amt.toLocaleString()+'円→'+(x.hit?('<span class="hit">的中 '+x.pay.toLocaleString()+'円</span>'):'<span class="miss">外れ</span>')+'</span>'; }).join('');
+    document.getElementById('result').innerHTML='<h2>結果・予想突合</h2><div class="sum">'
+      +tk('◎システム軸',t.axis)+tk('コンピ1位',t.compi1)+tk('1番人気',t.ninki1)
+      +(vt?('<div style="margin-top:6px">IPAT投票: '+vt+'</div>'):'<div class="note" style="margin:6px 0 0">IPAT投票なし(手動運用または見送り)</div>')+'</div>';
+  }
+  if(j.narrative){ document.getElementById('narr').textContent=j.narrative; }
+  else{ document.getElementById('narr').innerHTML='<span class="note" style="margin:0">（未作成）確定後に1レースずつ深掘りした振り返りがここに表示されます。源: C:\\jra\\reasons\\'+esc(j.date)+'\\'+esc(j.venue)+'_'+esc(j.race)+'.md</span>'; }
+}
+load();
 </script>
 </div></body></html>
 """;
@@ -1454,6 +1741,8 @@ th{color:#8a93a3;font-weight:600}
 td.r,th.r{text-align:right}
 .mk-axis{color:#ffd479;font-weight:700}.mk-rel{color:#7aa2ff;font-weight:700}.mk-oshi{color:#9aa3b2}
 .tag-good{color:#5fd38a;font-weight:600}.tag-warn{color:#ffae57}
+.stg{display:inline-block;min-width:16px;padding:0 3px;border-radius:3px;font-size:10px;font-weight:700;text-align:center;margin-left:4px;vertical-align:1px}
+.st-nige{background:#5a2222;color:#ff9d9d}.st-senko{background:#54401e;color:#ffce7a}.st-sashi{background:#1e4630;color:#7ee0a5}.st-oikomi{background:#1e3350;color:#8ec2ff}
 .memo{color:#8a93a3;font-size:12px}.pend{color:#8a93a3}
 .hinfo{color:#9aa3b2;font-size:11px;margin-left:5px}.hinfo .bwp{color:#f0a868}.hinfo .bwm{color:#7aa2ff}
 /* 式別/方式/モードのラジオ群 */
@@ -1468,11 +1757,12 @@ td.r,th.r{text-align:right}
 tr.axisrow td{background:#15130a}
 tr.danso td{text-align:center;color:#ffd479;background:#1a1508;font-size:12px;padding:2px;letter-spacing:3px;border-bottom:1px solid #4a3d10}
 </style></head><body><div class="wrap">
-<a class="back" href="/races">← 今日のレース一覧</a>　<a id="sbk" class="back" href="#">🐎 出馬表へ戻る</a>　<a class="back" href="/">🏠 コントロール</a>　<a class="back" href="/history">📋 投票履歴</a>
+<a class="back" href="/races">← 今日のレース一覧</a>　<a id="sbk" class="back" href="#">🐎 出馬表へ戻る</a>　<a id="rbk" class="back" href="#">🧠 選定理由 →</a>　<a class="back" href="/">🏠 コントロール</a>　<a class="back" href="/history">📋 投票履歴</a>
 <div id="rnav" class="note" style="margin:6px 0;font-size:14px">　</div>
 <h1 id="hd">読込中...</h1>
 <div class="note" id="meta"></div>
 <div class="sum" id="sum"></div>
+<div class="note" id="voted" style="margin:2px 0"></div>
 <div class="note">列見出し（印/指数/h2h確度/単勝/複勝/人気/着）クリックで昇順・降順ソート</div>
 <div style="margin:6px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
   <button onclick="showSelectedShutuba()" style="padding:4px 12px;border-radius:6px;border:1px solid #39414d;background:#2a313c;color:#e6e9ef;cursor:pointer;font-weight:600">📋 選択馬の馬柱</button>
@@ -1481,12 +1771,13 @@ tr.danso td{text-align:center;color:#ffd479;background:#1a1508;font-size:12px;pa
   <span class="note" style="margin:0">※馬名左のチェックで選び「選択馬の馬柱」をクリック</span>
 </div>
 <table><thead><tr><th id="bh-mark" data-l="印" onclick="hSortBy('mark')" style="cursor:pointer">印</th><th class="r">馬</th><th>馬名</th><th id="bh-idx" data-l="指数(Δ)" onclick="hSortBy('idx')" style="cursor:pointer">指数(Δ)</th><th id="bh-h2h" data-l="h2h確度" onclick="hSortBy('h2h')" style="cursor:pointer">h2h確度</th><th id="bh-pf" data-l="複勝確率" onclick="hSortBy('pf')" style="cursor:pointer" title="ベイズ較正モデルA(コンピ順位+指数+h2h)の複勝確率(表示用・確度)">複勝確率</th><th id="bh-tan" class="r" data-l="単勝(現)" onclick="hSortBy('tan')" style="cursor:pointer">単勝(現)</th><th id="bh-fuku" data-l="複勝(現)" onclick="hSortBy('fuku')" style="cursor:pointer">複勝(現)</th><th id="bh-pop" class="r" data-l="人気" onclick="hSortBy('pop')" style="cursor:pointer">人気</th><th id="bh-chaku" class="r" data-l="着" onclick="hSortBy('chaku')" style="cursor:pointer">着</th><th>確定払戻</th><th>メモ</th></tr></thead><tbody id="tb"></tbody></table>
-<div class="note">◎軸/○▲△相手/押=押さえ。h2h確度=同条件限定h2hの順位+タグ(両1位=鉄板/h2h不支持・地力先行=注意)。↑指数×短縮=堅め/×延長=やや割引。確度であり+EVではありません。</div>
+<div class="note">◎軸/○▲△相手/押=押さえ。h2h確度=同条件限定h2hの順位+タグ(両1位=鉄板/h2h不支持=注意/h2h実力馬=h2h上位×コンピ4-7位=市場過小評価の実力上位馬・複勝率26-35%)。↑指数×短縮=堅め/×延長=やや割引。確度であり+EVではありません。</div>
 <div class="sum">
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:6px">
     <div style="font-weight:600">🎯 IPAT投票Lite風（買い目を作成→リストに追加→まとめて投票）</div>
-    <div style="font-size:13px;display:flex;align-items:center;gap:8px" title="IPATの投票可能額。JRAは残高照会が未実装のため未対応表示。">
-      <span class="note">投票可能額</span><span id="ipat-bal" style="font-weight:700;color:#8a93a3">未対応</span>
+    <div style="font-size:13px;display:flex;align-items:center;gap:8px" title="IPATの投票可能額。「更新」でIpatVoteが残高照会します(IPATにログイン)。">
+      <span class="note">投票可能額</span><span id="ipat-bal" style="font-weight:700;color:#8a93a3">—</span>
+      <button id="ipat-bal-btn" onclick="refreshIpatBal()" style="background:#1f2a3a;color:#9ec1ff;border:1px solid #2f4560;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer" title="IPATにログインして残高を照会">更新</button>
     </div>
   </div>
   <div style="font-size:13px;margin-bottom:4px">
@@ -1524,7 +1815,7 @@ function o1(x){ return (x&&x>0)?Number(x).toFixed(1):''; }
 function qp(k){return new URLSearchParams(location.search).get(k)||'';}
 function dq(){return qp('date')?('&date='+encodeURIComponent(qp('date'))):'';}  // 過去日買目(投票履歴クリック)用。当日は空。
 function markCls(m){return m==='◎'?'mk-axis':(m==='押'?'mk-oshi':'mk-rel');}
-function h2hHtml(s){ if(!s)return ''; var c=''; if(s.indexOf('両1位')>=0)c='tag-good'; else if(s.indexOf('不支持')>=0||s.indexOf('地力先行')>=0)c='tag-warn'; return '<span class="'+c+'">'+esc(s)+'</span>'; }
+function h2hHtml(s){ if(!s)return ''; var c=''; if(s.indexOf('両1位')>=0||s.indexOf('h2h実力馬')>=0)c='tag-good'; else if(s.indexOf('不支持')>=0)c='tag-warn'; return '<span class="'+c+'">'+esc(s)+'</span>'; }
 // v-bt/v-method/v-mode/v-ax2pos はラジオ群(SPANコンテナ)、v-st等はinput。両対応で値を読む。
 function val(id){ var el=document.getElementById(id); if(!el)return ''; if(el.tagName==='SPAN'){ var r=el.querySelector('input[type=radio]:checked'); return r?r.value:''; } return el.value; }
 // ラジオ群を生成(opts=文字列 or {v,l})。cur=初期チェック値。oc=変更時ハンドラ。
@@ -1534,6 +1825,31 @@ var HORSES=[], hSortKey='rk', hSortDir=1, CART=[], SHUTUBASEL={}, FRAME={};
 // 馬番/枠番を枠色の囲い数字に(枠連は番号=枠、他は当該馬の実枠FRAME[馬番])。JRAは枠単なし。
 function wkN(bt,u){ var n=+u; if(!n)return esc(''+u); var f=(bt==='枠連')?((n>=1&&n<=8)?n:0):((window.FRAME&&FRAME[n]>0)?FRAME[n]:0); return '<span class="wk f'+f+'" style="min-width:17px;padding:0 3px;font-size:12px">'+n+'</span>'; }
 function wkNums(bt,s){ return (''+s).split(/[,\-]/).filter(function(x){return x!==''&&x!=null;}).map(function(u){return wkN(bt,u);}).join(' '); }
+// 投票済み馬券の式別/軸/相手を整形。順不同(馬連/枠連/ワイド/三連複)=「-」/着順あり(三連単/馬単)=「→」。馬番は枠色。
+function fmtVoted(b){
+  var bt=b.bt||'', ax=(''+(b.axis||'')).trim?(''+(b.axis||'')).trim():(''+(b.axis||'')), aite=b.aite||'', kumi=b.kumi||'';
+  var mp=(b.method&&b.method!=='通常')?(esc(b.method)+' '):'';
+  var sep=(/馬連|枠連|ワイド|三連複/.test(bt))?' - ':' → ';
+  if(ax&&aite){ return mp+wkN(bt,ax)+sep+wkNums(bt,aite)+(b.pts>1?'（'+b.pts+'点）':''); }
+  if(kumi){ return mp+wkNums(bt,kumi)+(b.pts>1?'（'+b.pts+'点）':''); }
+  if(ax){ return mp+wkN(bt,ax); }
+  return mp+wkNums(bt,aite);
+}
+// 🎫 投票済み(IPAT 実投票=IPAT投票履歴・結果'投票完了')。本線の下。データはbuyme.ps1のj.voted。
+function renderVoted(j){
+  var vd=document.getElementById('voted'); if(!vd)return;
+  var vlist=j.voted||[];
+  if(!vlist.length){ vd.innerHTML=''; return; }
+  var tot=0,totPay=0;
+  var rows=vlist.map(function(b){ tot+=(b.amt||0); totPay+=(b.pay||0);
+    return '<span style="display:inline-block;margin:1px 6px 1px 0;padding:1px 7px;border-radius:4px;background:#1b2230;border:1px solid #2c3647">'
+      +'<b>'+esc(b.bt)+'</b> '+fmtVoted(b)
+      +(b.amt?' <span style="color:#9aa3b2">'+Number(b.amt).toLocaleString()+'円</span>':'')
+      +(b.hit?' <span class="tag-good">的中'+(b.pay?' '+Number(b.pay).toLocaleString()+'円':'')+'</span>':'')
+      +'</span>'; }).join('');
+  vd.innerHTML='<div class="note" style="margin:0 0 2px">🎫 投票済み（IPAT 実投票）計'+Number(tot).toLocaleString()+'円'
+    +(j.finished?' ／ 払戻'+Number(totPay).toLocaleString()+'円・収支'+(totPay-tot>=0?'+':'')+Number(totPay-tot).toLocaleString()+'円':'')+'</div>'+rows;
+}
 function toggleSel(el){ var u=el.getAttribute('data-uma'); if(el.checked){SHUTUBASEL[u]=true;}else{delete SHUTUBASEL[u];} }
 function showSelectedShutuba(){ var us=Object.keys(SHUTUBASEL).filter(function(u){return SHUTUBASEL[u];}); if(!us.length){ alert('馬柱に表示する馬を（馬名の左のチェックで）選択してください'); return; } us.sort(function(a,b){return a-b;}); var v=qp('venue'),r=qp('race'),d=qp('date'),dq=d?'&date='+encodeURIComponent(d):''; location.href='/shutuba?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+dq+'&umas='+encodeURIComponent(us.join(',')); }
 function selAll(on){ (HORSES||[]).forEach(function(h){ if(h.scratched)return; if(on){SHUTUBASEL[h.uma]=true;}else{delete SHUTUBASEL[h.uma];} }); renderHorses(); }
@@ -1558,7 +1874,9 @@ function renderHorses(){
     var tn=h.tan?o1(h.tan):'—';
     var mk=h.mark?('<span class="'+markCls(h.mark)+'">'+esc(h.mark)+'</span>'):'';
     var selchk='<input type="checkbox" class="umck" data-uma="'+h.uma+'" onchange="toggleSel(this)"'+(SHUTUBASEL[h.uma]?' checked':'')+' style="margin-right:5px;vertical-align:middle" title="馬柱に表示する馬を選択">';
-    var nmInner=selchk+esc(h.name)+hMeta(h);
+    var stMap={'逃げ':['逃','st-nige'],'先行':['先','st-senko'],'差し':['差','st-sashi'],'追込':['追','st-oikomi']};
+    var stTag=(h.style&&stMap[h.style])?('<span class="stg '+stMap[h.style][1]+'" title="予測脚質(直近5走の平均通過・買目/馬柱/通知と同一定義): '+esc(h.style)+'">'+stMap[h.style][0]+'</span>'):'';
+    var nmInner=selchk+esc(h.name)+stTag+hMeta(h);
     var nameCell=h.qual?('<td class="qcell" data-q="'+escA(h.qual)+'" title="'+escA(h.qual)+'" style="cursor:pointer" onclick="showQual(this)">'+nmInner+' <span style="text-decoration:underline dotted">💬</span></td>'):('<td>'+nmInner+'</td>');
     var chk=h.chaku?('<span class="'+(h.chaku===1?'mk-axis':'')+'">'+esc(h.chaku)+'</span>'):'';
     var conf=[]; if(h.tanPay)conf.push('単'+Number(h.tanPay).toLocaleString()); if(h.fukuPay)conf.push('複'+Number(h.fukuPay).toLocaleString());
@@ -1736,7 +2054,7 @@ async function refreshData(){
   var v=qp('venue'),r=qp('race');
   var j; try{ j=await (await fetch('/api/buyme?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+dq())).json(); }catch(e){ return; }
   if(j.error)return;
-  HORSES=j.horses||[]; FRAME={}; HORSES.forEach(function(h){ FRAME[h.uma]=h.frame||0; }); renderHorses();   // 表(オッズ/着/断層)のみ更新=投票ビルダー(v-bt/CART/選択)は不変
+  HORSES=j.horses||[]; FRAME={}; HORSES.forEach(function(h){ FRAME[h.uma]=h.frame||0; }); renderHorses(); renderVoted(j);   // 表(オッズ/着/断層/投票済み)のみ更新=投票ビルダー(v-bt/CART/選択)は不変
   var started=j.finished||postPassed(j.post);
   if(started){ ['v-go','v-add'].forEach(function(id){ var b=document.getElementById(id); if(b){b.disabled=true;b.style.opacity='0.5';} }); }
 }
@@ -1744,6 +2062,7 @@ async function load(){
   var v=qp('venue'),r=qp('race'),d=qp('date');
   setNav(v,r);
   var sbk=document.getElementById('sbk'); if(sbk){ sbk.href='/shutuba?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+(d?'&date='+encodeURIComponent(d):''); }
+  var rbk=document.getElementById('rbk'); if(rbk){ rbk.href='/reason?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+(d?'&date='+encodeURIComponent(d):''); }
   var j; try{ j=await (await fetch('/api/buyme?venue='+encodeURIComponent(v)+'&race='+encodeURIComponent(r)+dq())).json(); }catch(e){ document.getElementById('hd').textContent='読込失敗'; return; }
   if(j.error){ document.getElementById('hd').textContent=esc(j.error); return; }
   document.getElementById('hd').textContent=esc(j.post)+' '+esc(j.venue)+' '+esc(j.race)+'R '+(j.dist?esc(j.dist)+'m':'')+(j.raceName?' '+esc(j.raceName):'');
@@ -1754,6 +2073,7 @@ async function load(){
   var ax=null; for(var i=0;i<j.horses.length;i++){ if(j.horses[i].mark==='◎'){ax=j.horses[i];break;} }
   FRAME={}; (j.horses||[]).forEach(function(h){ FRAME[h.uma]=h.frame||0; });   // 枠色の囲い馬番用
   document.getElementById('sum').innerHTML='本線：軸◎ '+(ax?wkN('',ax.uma)+' '+esc(ax.name):'(なし)');
+  renderVoted(j);   // 🎫 投票済み（IPAT実投票）を本線の下に
   HORSES=j.horses||[];
   renderHorses();
   if(!HORSES.length){ document.getElementById('tb').innerHTML='<tr><td colspan="11" class="pend" style="padding:14px">この日・このレースの買目データがありません（コンピ指数未取得＝非開催日や、まだ出馬表・コンピが取り込まれていないレースの可能性）。</td></tr>'; }
@@ -1768,7 +2088,25 @@ async function load(){
   if(j.cancelled){ ['v-go','v-add'].forEach(function(id){ var b=document.getElementById(id); if(b){b.disabled=true;b.style.opacity='0.5';} }); document.getElementById('meta').innerHTML='<span style="color:#ff6b6b;font-weight:700">🚫 このレースは取りやめ(中止)に設定されています。投票できません。</span><br>'+document.getElementById('meta').innerHTML; document.getElementById('v-res').textContent='🚫取りやめのため投票不可。'; }  // A9
   var rfp=new URLSearchParams(location.search).get('refresh'); var _rf=rfp===null?5:+rfp; if(_rf>0)setInterval(refreshData,_rf*1000);  // A5:データのみ自動更新(既定5秒・?refresh=0で無効)
 }
-load();
+// IPAT投票可能額(残高)。初期=直近値(照会せず)、更新ボタン=IpatVote balanceをバックグラウンド照会→状態ポーリング。地方rakuten-balance移植。
+async function loadIpatBal(){
+  try{ var j=await (await fetch('/api/ipat-balance')).json(); var el=document.getElementById('ipat-bal'); if(!el)return;
+    if(j&&j.balance!=null){ el.textContent=Number(j.balance).toLocaleString()+'円'+(j.balT?'（'+j.balT+'）':''); el.style.color='#7ee787'; }
+    else { el.textContent='未取得'; el.style.color='#8a93a3'; } }catch(e){}
+}
+async function refreshIpatBal(){
+  var el=document.getElementById('ipat-bal'), btn=document.getElementById('ipat-bal-btn'); if(!el)return;
+  el.textContent='照会中…（IPATログイン）'; el.style.color='#e6e9ef'; if(btn)btn.disabled=true;
+  try{ await fetch('/api/ipat-balance-refresh',{method:'POST'}); }catch(e){}
+  var tries=0; var timer=setInterval(async function(){ tries++;
+    try{ var s=await (await fetch('/api/ipat-balance-status')).json();
+      if(s&&s.done){ clearInterval(timer); if(btn)btn.disabled=false;
+        if(s.balance!=null){ el.textContent=Number(s.balance).toLocaleString()+'円'; el.style.color='#7ee787'; el.title=''; }
+        else { el.textContent=(s.message||'未取得'); el.style.color='#ffb454'; el.title=s.message||''; } } }catch(e){}
+    if(tries>45){ clearInterval(timer); if(btn)btn.disabled=false; if(('' +el.textContent).indexOf('照会中')>=0){ el.textContent='タイムアウト'; el.style.color='#ff8a8a'; } }
+  },2000);
+}
+load(); loadIpatBal();
 </script>
 </div></body></html>
 """;
@@ -1795,10 +2133,12 @@ td.hcell{min-width:118px;max-width:140px;white-space:normal}
 .f1{background:#f3f3f3;color:#111}.f2{background:#1a1a1a;color:#fff}.f3{background:#e23b3b;color:#fff}.f4{background:#3b6fe2;color:#fff}
 .f5{background:#f3d03a;color:#111}.f6{background:#3aae54;color:#fff}.f7{background:#e8862a;color:#fff}.f8{background:#e86fa0;color:#111}.f0{background:#222a35;color:#fff}
 .ch{color:#9aa3b2;font-size:10px}.nm{font-weight:700;font-size:13px;white-space:normal}.sx{color:#9aa3b2;font-size:10px}
+.stg{display:inline-block;min-width:16px;padding:0 3px;border-radius:3px;font-size:10px;font-weight:700;text-align:center;margin-left:4px;vertical-align:1px}
+.st-nige{background:#5a2222;color:#ff9d9d}.st-senko{background:#54401e;color:#ffce7a}.st-sashi{background:#1e4630;color:#7ee0a5}.st-oikomi{background:#1e3350;color:#8ec2ff}
 .mk{color:#ffd479;font-weight:800;font-size:14px}.idx{color:#7aa2ff;font-weight:700}
 .sm{color:#9aa3b2;font-size:10px;white-space:normal}
 .pc .p-r{font-weight:800;font-size:13px}.pc .p-t{color:#9aa3b2;font-weight:400;font-size:10px}
-.pc .p-v{color:#cbd2e0}.pc .p-c{color:#9aa3b2;font-size:10px}.pc .p-n{color:#8a93a3;font-size:10px;white-space:normal;overflow:hidden;text-overflow:ellipsis;max-width:130px}
+.pc .p-v{color:#cbd2e0}.pc .p-c{color:#9aa3b2;font-size:10px}.pc .p-cmp{color:#7fc8ff;font-size:10px;font-weight:700}.pc .p-n{color:#8a93a3;font-size:10px;white-space:normal;overflow:hidden;text-overflow:ellipsis;max-width:130px}
 .pc .p-tm{color:#e6e9ef}.pc .p-x{color:#9aa3b2;font-size:10px}
 .b1{background:#33290a !important}.b2{background:#23282f !important}.b3{background:#2c2113 !important}
 .chk1,.chk2,.chk3{font-weight:800;padding:0 6px;border-radius:9px;color:#15130a}
@@ -1806,6 +2146,9 @@ td.hcell{min-width:118px;max-width:140px;white-space:normal}
 .empty{color:#444;text-align:center}
 .wp{color:#ff8a8a;font-size:10px}.wm{color:#7ad1a0;font-size:10px}
 .pc .p-mg{color:#cbd2e0;font-weight:600;font-size:10px}
+/* 過去走の脚質バッジ(逃赤/先橙/差青/追緑) */
+.kb{display:inline-block;min-width:15px;padding:0 3px;border-radius:3px;font-size:10px;font-weight:800;text-align:center;margin-left:3px;vertical-align:1px;color:#fff}
+.k-nige{background:#e23b3b}.k-senko{background:#e8862a}.k-sashi{background:#3b6fe2}.k-oikomi{background:#3aae54}
 .ivr td.ivl{writing-mode:horizontal-tb;text-orientation:mixed;font-size:9px;font-weight:600;color:#6b7382;min-width:42px}
 .ivc{text-align:center;font-size:11px;color:#9aa3b2;background:#0e1218;padding:2px 4px;white-space:nowrap}
 .ivc.rest{color:#ffb454;font-weight:800;background:#2e2310;border-top:2px solid #c8861f;border-bottom:2px solid #c8861f}
@@ -1816,7 +2159,7 @@ td.hcell{min-width:118px;max-width:140px;white-space:normal}
 .ctrl select{background:#1a1f29;color:#e6e6e6;border:1px solid #39404d;border-radius:5px;padding:3px 6px;font-size:13px;margin:0 2px}
 .ctrl .nav{color:#7db4ff;text-decoration:none;margin:0 6px;font-weight:600}.ctrl .nav.off{color:#555;margin:0 6px}
 </style></head><body><div class="wrap">
-<a class="back" href="/races">← 今日のレース一覧</a>　<a id="histlink" class="back" href="/history">📋 投票履歴 →</a>
+<a class="back" href="/">🏠 コントロールに戻る</a>　<a class="back" href="/races">← 今日のレース一覧</a>　<a id="rbk" class="back" href="#">🧠 選定理由 →</a>　<a id="histlink" class="back" href="/history">📋 投票履歴 →</a>
 <h1 id="hd">読込中...</h1>
 <div id="ctrl" class="ctrl"></div>
 <div id="buylink" style="margin:6px 0 8px"></div>
@@ -1827,6 +2170,8 @@ function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'
 function qp(k){return new URLSearchParams(location.search).get(k)||'';}
 function fmtTime(t){ var s=Number(t); if(!s||isNaN(s)||s<=0)return ''; var m=Math.floor(s/60); var sec=s-m*60; return m>0?(m+'.'+(sec<10?'0':'')+sec.toFixed(1)):sec.toFixed(1); }
 function chBadge(c){ return (c>=1&&c<=3)?('<span class="chk'+c+'">'+c+'</span>'):esc(c); }
+// 過去走の脚質バッジ: その走の最終コーナー通過位置÷頭数で 逃/先/差/追 を判定し色分け
+function kyakuBadge(p){ if(!p||!p.corner||!p.tousu)return ''; var cs=(''+p.corner).split('-').map(Number).filter(function(x){return x>0;}); if(!cs.length)return ''; var n=+p.tousu; if(!(n>0))return ''; var avg=cs.reduce(function(a,b){return a+b;},0)/cs.length; var r=avg/n,cls,lab; if(avg<=1.5||r<=0.15){cls='k-nige';lab='逃';}else if(r<=0.35){cls='k-senko';lab='先';}else if(r<=0.65){cls='k-sashi';lab='差';}else{cls='k-oikomi';lab='追';} return '<span class="kb '+cls+'" title="脚質(平均通過'+avg.toFixed(1)+'番手/'+n+'頭)">'+lab+'</span>'; }
 function pcell(p){
   if(!p) return '<td class="hcell empty">—</td>';
   var b=(p.chaku>=1&&p.chaku<=3)?(' b'+p.chaku):'';
@@ -1834,9 +2179,10 @@ function pcell(p){
   var zen=p.zen3f?('前'+esc(p.zen3f)+'　'):'';
   var nav=(p.fd&&p.ven)?(' onclick="location.href=\'/shutuba?venue='+encodeURIComponent(p.ven)+'&race='+p.race+'&date='+p.fd+'\'" style="cursor:pointer" title="この日の馬柱へ"'):'';
   return '<td class="hcell pc'+b+'"'+nav+'>'
-    +'<div class="p-r">'+chBadge(p.chaku)+(p.tousu?'<span class="p-t">/'+esc(p.tousu)+'頭</span>':'')+((p.margin!==''&&p.margin!=null)?' <span class="p-mg">'+esc(p.margin)+'秒</span>':'')+'</div>'
+    +'<div class="p-r">'+chBadge(p.chaku)+(p.tousu?'<span class="p-t">/'+esc(p.tousu)+'頭</span>':'')+kyakuBadge(p)+((p.margin!==''&&p.margin!=null)?' <span class="p-mg">'+esc(p.margin)+'秒</span>':'')+'</div>'
     +'<div class="p-v">'+esc(p.ven)+' '+esc(p.d)+'</div>'
     +'<div class="p-c">'+esc(p.cond)+' '+esc(p.kind)+esc(p.dist)+(p.corner?'　通過'+esc(p.corner):'')+'</div>'
+    +((p.cRk>0||p.cIdx>0)?'<div class="p-cmp">コンピ'+(p.cRk>0?esc(p.cRk)+'位':'-')+(p.cIdx>0?'　指'+esc(p.cIdx):'')+'</div>':'')
     +'<div class="p-n">'+esc(p.name)+'</div>'
     +'<div class="p-tm">'+esc(fmtTime(p.time))+'　'+zen+ag+'</div>'
     +'<div class="p-x">'+(p.wt?'体'+esc(p.wt)+'　':'')+esc(p.jk)+(p.kin?' '+esc(Number(p.kin)):'')+'</div>'
@@ -1848,9 +2194,9 @@ function render(j){
   function row(lbl,cellFn,cls){ var tds=hs.map(cellFn).join(''); return '<tr><td class="lbl">'+lbl+'</td>'+tds+'</tr>'; }
   var html='';
   html+=row('枠 馬',function(h){ return '<td class="hcell fr f'+(h.frame||0)+'">'+(h.frame||'')+'枠<br>'+esc(h.uma)+'</td>'; });
-  html+=row('馬名',function(h){ return '<td class="hcell">'
+  html+=row('馬名',function(h){ var stMap={'逃げ':['逃','st-nige'],'先行':['先','st-senko'],'差し':['差','st-sashi'],'追込':['追','st-oikomi']}; var stTag=(h.style&&stMap[h.style])?('<span class="stg '+stMap[h.style][1]+'" title="予測脚質(直近5走の平均通過): '+esc(h.style)+'">'+stMap[h.style][0]+'</span>'):''; return '<td class="hcell">'
     +'<div class="ch">'+esc(h.chichi)+'</div>'
-    +'<div class="nm">'+esc(h.name)+'</div>'
+    +'<div class="nm">'+esc(h.name)+stTag+'</div>'
     +'<div class="sx">'+esc(h.sex)+(h.age?esc(h.age):'')+'</div>'
     +((h.haha||h.bofu)?'<div class="sx">'+esc(h.haha)+(h.bofu?'（'+esc(h.bofu)+'）':'')+'</div>':'')
     +'</td>'; });
@@ -1905,6 +2251,7 @@ async function load(){
   var qd=j.date?'&date='+encodeURIComponent(j.date):'';
   document.getElementById('buylink').innerHTML='<a class="buy" href="/buyme?venue='+encodeURIComponent(j.venue)+'&race='+encodeURIComponent(j.race)+qd+'">🎯 このレースの買目を見る →</a>';
   document.getElementById('histlink').href='/history?venue='+encodeURIComponent(j.venue)+(j.date?'&date='+encodeURIComponent(j.date):'');
+  var rbk=document.getElementById('rbk'); if(rbk){ var rv=qp('venue'),rr=qp('race'),rd=qp('date'); rbk.href='/reason?venue='+encodeURIComponent(rv)+'&race='+encodeURIComponent(rr)+(rd?'&date='+encodeURIComponent(rd):''); }
   buildCtrl(j);
   render(j);
 }
